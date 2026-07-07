@@ -1,0 +1,7 @@
+streamlit[pdf]>=1.49.0
+pandas>=2.2.0
+pypdf>=5.0.0
+PyMuPDF>=1.24.0
+python-dotenv>=1.0.0
+openai>=1.93.0
+openpyxl>=3.1.0

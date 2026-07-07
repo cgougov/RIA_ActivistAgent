@@ -1,0 +1,15 @@
+document_id,fund_id,file_name,document_type,document_title,document_date,date_precision,source_evidence,review_status
+doc_001,fund_001,UMJ_FS.pdf,factsheet,VPL-I Trust Monthly Report,needs_review,month,"Page 1: VPL-I Trust; Monthly Report - May 2026; VARECS Partners Limited.",needs_review
+doc_002,fund_001,UMJ_PRS.pdf,presentation,Investment Opportunities in Japanese Small Cap Companies / VPL-I Trust,needs_review,month,"Page 1: VARECS Partners Limited; Mar 2018; VPL-I Trust.",needs_review
+doc_003,fund_002,Simplex_FS.pdf,factsheet,Simplex Value Up Strategy,2025-09-30,day,"Page 1: Simplex Value Up Strategy; September 2025; as of September 30th, 2025.",pending_approval
+doc_004,fund_002,Simplex_PRS.pdf,presentation,Simplex Value Up Trust,needs_review,month,"Page 1: Simplex Value Up Trust; 2015 June.",needs_review
+doc_005,fund_003,Strategic_FS.pdf,factsheet,Strategic Capital Japan-Up Investment Strategy,2026-05-31,day,"Page 1: Monthly May 2026; summary statistics as of 05/31/2026.",pending_approval
+doc_006,fund_003,Strategic_PRS.pdf,presentation,Japanese Activist Introductory Presentation,needs_review,month,"Page 1: Japanese Activist Introductory Presentation; March 2018; Strategic Capital Inc.",needs_review
+doc_007,fund_004,Misaki_FS.pdf,factsheet,Misaki Engagement Fund Monthly Reference Materials,needs_review,month,"Page 1: MISAKI ENGAGEMENT FUND; Monthly Reference Materials; April 2026.",needs_review
+doc_008,fund_004,Misaki_PRS.pdf,presentation,Misaki Capital Inc. Japan Constructivism,needs_review,month,"Page 1: Misaki Capital Inc.; Japan Constructivism; November 2014.",needs_review
+doc_009,fund_005,Edwall_FS.pdf,factsheet,"Edwall Japan Strategies, LP",needs_review,month,"Page 1: Edwall Japan Strategies LP; April 2026; Edwall Management.",needs_review
+doc_010,fund_005,Edwall_PRS.pdf,presentation,Edwall Management / Edwall Japan Strategies LP,needs_review,quarter,"Page 1: Q2 2022; Edwall Management; Edwall Japan Strategies LP.",needs_review
+doc_011,fund_006,Begonia_FSpdf.pdf,factsheet,Begonia Capital Update,2026-05-31,day,"Page 1: 31 May 2026; Begonia Capital had a net return.",pending_approval
+doc_012,fund_006,Begonia_Presentaton.pdf,presentation,Begonia Capital Presentation,needs_review,month,"Pages 3 and 16: Begonia Capital; fund terms; expected launch May 2024.",needs_review
+doc_013,fund_007,Ichigo_FS.pdf,factsheet,Ichigo Portfolio Update,2026-04-30,day,"Page 1: As of Valuation Date: 30 April 2026; Ichigo.",pending_approval
+doc_014,fund_007,Ichigo_PRS.pdf,presentation,Ichigo Asset Management Presentation,needs_review,month,"Page 1: Ichigo Asset Management; June 2015.",needs_review

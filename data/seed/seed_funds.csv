@@ -1,0 +1,8 @@
+fund_id,fund_name,manager_name,status,first_document,document_type,document_date,notes
+fund_001,VPL-I Trust,VARECS Partners Limited,needs_review,UMJ_FS.pdf,factsheet,needs_review,"PDF text identifies VPL-I Trust and VARECS Partners Limited; upload label says UMJ."
+fund_002,Simplex Value Up Strategy,"Simplex Asset Management Co., Ltd.",needs_review,Simplex_FS.pdf,factsheet,2025-09-30,"Confirm preferred display name versus Simplex Value Up Trust."
+fund_003,Strategic Capital Japan-Up Investment Strategy,"Strategic Capital, Inc.",needs_review,Strategic_FS.pdf,factsheet,2026-05-31,"Factsheet is Monthly May 2026."
+fund_004,Misaki Engagement Fund,Misaki Capital Inc.,needs_review,Misaki_FS.pdf,factsheet,needs_review,"Factsheet says April 2026; exact date needs review."
+fund_005,"Edwall Japan Strategies, LP","Edwall Management, LP",needs_review,Edwall_FS.pdf,factsheet,needs_review,"Factsheet says April 2026; exact date needs review."
+fund_006,Begonia Capital,Privium Fund Management (Singapore) Pte. Ltd.,needs_review,Begonia_FSpdf.pdf,factsheet,2026-05-31,"Factsheet dated 31 May 2026."
+fund_007,Ichigo Activism / Engagement Fund,"Ichigo Asset Management International, Pte. Ltd.",needs_review,Ichigo_FS.pdf,factsheet,2026-04-30,"User confirmed Ichigo is one activism fund."

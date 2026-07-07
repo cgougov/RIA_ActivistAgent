@@ -150,6 +150,17 @@ def cmd_review(args):
             print(f"Approved {len(returns)} return rows.")
             return
 
+        if args.approve_all:
+            for row in proposals:
+                key = review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer)
+                print(f"  approved {key}: {row['value'][:60]}")
+            for row in returns:
+                outcome = review_mod.approve_return_row(conn, row["row_id"], args.reviewer)
+                print(f"  approved return {row['period_type']} {row['period_end']}: {outcome}")
+            conn.commit()
+            print(f"Approved {len(proposals)} proposals and {len(returns)} return rows.")
+            return
+
         # Interactive review
         for index, row in enumerate(proposals, start=1):
             _print_proposal(row, index, len(proposals))
@@ -274,6 +285,8 @@ def main():
     p.add_argument("--approve-return-id")
     p.add_argument("--reject-return-id")
     p.add_argument("--approve-all-returns", action="store_true")
+    p.add_argument("--approve-all", action="store_true",
+                   help="approve every pending item for the document (review the list first)")
     p.add_argument("--value")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_review)
@@ -310,7 +323,10 @@ def main():
     p.set_defaults(func=cmd_log)
 
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        sys.exit(f"error: {exc}")
 
 
 if __name__ == "__main__":

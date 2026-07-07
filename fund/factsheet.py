@@ -115,6 +115,8 @@ def format_factsheet(sheet, show_sources=False):
         lines.append("-" * len(SECTION_TITLES[section]))
         for entry in entries:
             value = entry["value"]
+            if entry["unit"] == "percent" and "%" not in value:
+                value = f"{value}%"
             if entry["as_of_date"]:
                 value = f"{value}  (as of {entry['as_of_date']})"
             lines.append(f"  {entry['label']:<24} {value}")

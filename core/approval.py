@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from core.db import utc_now
+from core.fact_dedup import find_matching_approved_fact
 
 
 def _insert_approved_fact(connection, fact, approved_value, normalized_value, reviewer, note=""):
@@ -53,9 +54,37 @@ def _insert_approved_fact(connection, fact, approved_value, normalized_value, re
     return approved_fact_id
 
 
+def _mark_fact_as_approved(connection, fact_id, normalized_value, reviewer, note=""):
+    reviewed_at = utc_now()
+    connection.execute(
+        """
+        UPDATE extracted_facts
+        SET approval_status = 'approved',
+            normalized_value = ?,
+            reviewed_by = ?,
+            reviewed_at = ?,
+            review_note = ?
+        WHERE fact_id = ?
+        """,
+        (normalized_value, reviewer, reviewed_at, note, fact_id),
+    )
+
+
 def approve_fact_record(connection, fact, reviewer, note="", approved_value=None, normalized_value=None):
     approved_value = approved_value if approved_value is not None else fact["raw_value"]
     normalized_value = normalized_value if normalized_value is not None else (fact.get("normalized_value") or fact["raw_value"])
+    existing = find_matching_approved_fact(
+        connection,
+        fund_id=fact["fund_id"],
+        fact_category=fact["fact_category"],
+        fact_name=fact["fact_name"],
+        value=normalized_value,
+    )
+    if existing:
+        review_note = note or f"Matched existing approved fact {existing['approved_fact_id']}."
+        if fact.get("fact_id"):
+            _mark_fact_as_approved(connection, fact["fact_id"], normalized_value, reviewer, review_note)
+        return existing["approved_fact_id"]
     return _insert_approved_fact(connection, fact, approved_value, normalized_value, reviewer, note)
 
 
@@ -117,7 +146,16 @@ def approve_pending_facts(connection, fact_ids, reviewer, note="", approved_valu
             continue
         approved_value = approved_value_fn(fact) if approved_value_fn else fact["raw_value"]
         normalized_value = normalized_value_fn(fact) if normalized_value_fn else (fact["normalized_value"] or fact["raw_value"])
-        approved_fact_ids.append(_insert_approved_fact(connection, fact, approved_value, normalized_value, reviewer, note))
+        approved_fact_ids.append(
+            approve_fact_record(
+                connection,
+                fact,
+                reviewer=reviewer,
+                note=note,
+                approved_value=approved_value,
+                normalized_value=normalized_value,
+            )
+        )
     return approved_fact_ids
 
 

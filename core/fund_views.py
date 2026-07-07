@@ -1,16 +1,9 @@
 import statistics
 
-from core.fund_brief import build_fund_brief
+from core.fund_brief import _clean, _date_key, build_fund_brief
 from core.factsheet_schema import STANDARDIZED_FIELD_SPECS, STANDARDIZED_SECTION_ORDER
 from core.fund_snapshot import FundSnapshot
 from core.return_rows import MONTH_ORDER
-
-
-def _clean(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
 
 
 def _safe_float(value):
@@ -47,16 +40,6 @@ def format_return_cell(value):
     if rounded == int(rounded):
         return str(int(rounded))
     return f"{rounded:.1f}"
-
-
-def _date_key(row, *fields):
-    for field in fields:
-        value = _clean(row.get(field))
-        if value:
-            return value
-    return ""
-
-
 def _metric_rows(snapshot):
     latest = {}
     rows = sorted(

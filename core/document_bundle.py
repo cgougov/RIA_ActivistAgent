@@ -69,23 +69,26 @@ def _row_display_value(row):
     return value
 
 
-def _dedupe_exact_rows(rows):
-    deduped = []
-    seen = set()
+def _dedupe_by_key(rows, key_fn):
+    grouped = defaultdict(list)
+    ordered_keys = []
     for row in rows:
-        value = _clean_text(row.get("normalized_value")) or _clean_text(row.get("raw_value"))
-        key = (
+        key = key_fn(row)
+        if key not in grouped:
+            ordered_keys.append(key)
+        grouped[key].append(row)
+    return [_best_review_row(grouped[key]) for key in ordered_keys]
+
+
+def _dedupe_exact_rows(rows):
+    return _dedupe_by_key(
+        rows,
+        lambda row: (
             row.get("fact_category"),
             row.get("fact_name"),
-            (value or "").lower(),
-            row.get("page_number"),
-            row.get("approval_status"),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
-    return deduped
+            (_row_display_value(row) or "").lower(),
+        ),
+    )
 
 
 def _dedupe_people_rows(rows):
@@ -96,8 +99,7 @@ def _dedupe_people_rows(rows):
             if value:
                 role_specific_names.add(value.lower())
 
-    deduped = []
-    seen = set()
+    filtered = []
     for row in rows:
         value = _clean_text(row.get("normalized_value")) or _clean_text(row.get("raw_value"))
         fact_name = row.get("fact_name")
@@ -105,12 +107,14 @@ def _dedupe_people_rows(rows):
             continue
         if fact_name == "role_title":
             continue
-        key = (fact_name, (value or "").lower(), row.get("page_number"), row.get("approval_status"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(row)
-    return deduped
+        filtered.append(row)
+    return _dedupe_by_key(
+        filtered,
+        lambda row: (
+            row.get("fact_name"),
+            (_clean_text(row.get("normalized_value")) or _clean_text(row.get("raw_value")) or "").lower(),
+        ),
+    )
 
 
 def _writeup_priority(row):
@@ -139,12 +143,12 @@ def _dedupe_note_rows(rows):
     other_rows = []
     for row in rows:
         fact_name = row.get("fact_name")
-        if fact_name in {"neutral_summary", "differentiating_edge"}:
+        if fact_name in {"neutral_summary", "differentiating_edge", "data_limitations"}:
             grouped[fact_name].append(row)
         else:
             other_rows.append(row)
     deduped = list(other_rows)
-    for fact_name in ("neutral_summary", "differentiating_edge"):
+    for fact_name in ("neutral_summary", "differentiating_edge", "data_limitations"):
         candidates = grouped.get(fact_name, [])
         if candidates:
             deduped.append(sorted(candidates, key=_writeup_priority)[0])
@@ -190,26 +194,37 @@ def _build_field_entry(field_key, label, rows, *, empty_text):
 
 
 def _build_manager_entries(rows, *, empty_text):
-    values = []
+    grouped = defaultdict(list)
     for row in rows:
+        value = _row_display_value(row)
+        if value:
+            grouped[value.lower()].append(row)
+
+    best_rows = [
+        _best_review_row(grouped[key])
+        for key in sorted(grouped, key=lambda name: _review_priority(_best_review_row(grouped[name])))
+    ]
+    rendered_values = []
+    for row in best_rows:
         value = _row_display_value(row)
         if not value:
             continue
         if row.get("fact_name") in {"chief_investment_officer", "portfolio_manager", "founder"}:
             label = row.get("display_name") or row.get("fact_name", "").replace("_", " ").title()
-            values.append(f"{value} - {label}")
+            rendered_values.append(f"{value} - {label}")
         else:
-            values.append(value)
-    display_value = "; ".join(values) if values else None
+            rendered_values.append(value)
+
+    display_value = "; ".join(rendered_values) if rendered_values else None
     return [
         {
             "field_key": "people_roles",
             "label": "People / roles",
-            "rows": rows,
-            "best_row": _best_review_row(rows),
+            "rows": best_rows or rows,
+            "best_row": _best_review_row(best_rows or rows),
             "display_value": display_value,
-            "status_summary": _status_summary(rows, "approval_status", empty_text=empty_text),
-            "candidate_count": len(rows),
+            "status_summary": _status_summary(best_rows or rows, "approval_status", empty_text=empty_text),
+            "candidate_count": len(best_rows or rows),
             "empty_text": empty_text,
             "approved_display_value": None,
             "approved_source": None,

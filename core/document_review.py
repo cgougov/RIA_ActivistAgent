@@ -1,4 +1,10 @@
-from core.approval import approve_extracted_fact, approve_pending_facts, reject_pending_facts, revise_pending_fact
+from core.approval import (
+    approve_extracted_fact,
+    approve_pending_facts,
+    reject_pending_facts,
+    reopen_rejected_fact,
+    revise_pending_fact,
+)
 from core.document_bundle import SECTION_ORDER, build_document_bundle
 from core.promotion import promote_approved_fact_ids
 from core.return_rows import approve_proposed_return_rows, reject_proposed_return_rows, revise_proposed_return_row
@@ -140,3 +146,30 @@ def reject_document_return_row(connection, proposed_row_id, *, reviewer, note=""
         note=note or f"Rejected pending return row {proposed_row_id} from document bundle.",
     )
     return {"proposed_row_id": proposed_row_id}
+
+
+def revise_document_fact(connection, fact_id, *, reviewer, raw_value=None, normalized_value=None, note=""):
+    return revise_pending_fact(
+        connection,
+        fact_id,
+        raw_value=raw_value,
+        normalized_value=normalized_value,
+        reviewer=reviewer,
+        note=note or f"Revised pending fact {fact_id} from document bundle.",
+    )
+
+
+def reopen_document_fact(connection, fact_id, *, reviewer, raw_value, normalized_value, note=""):
+    reopen_rejected_fact(
+        connection,
+        fact_id,
+        raw_value,
+        normalized_value,
+        reviewer,
+        note or f"Reopened rejected fact {fact_id} from document bundle.",
+    )
+    return {
+        "fact_id": fact_id,
+        "raw_value": raw_value,
+        "normalized_value": normalized_value,
+    }

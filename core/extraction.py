@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from core.config import DEFAULT_MODEL, PROMPT_VERSION
 from core.db import utc_now
+from core.fact_dedup import find_matching_approved_fact, find_matching_extracted_fact
 from core.taxonomy import extraction_schema_text, extraction_scope_names, valid_fact_names
 
 
@@ -238,15 +239,51 @@ def save_extraction_run(connection, document, facts, model_name, raw_output, sco
         (run_id, document["document_id"], scope, model_name, PROMPT_VERSION, now, now, raw_output),
     )
     for fact in facts:
+        duplicate_match = find_matching_extracted_fact(
+            connection,
+            fund_id=document["fund_id"],
+            fact_category=fact["fact_category"],
+            fact_name=fact["fact_name"],
+            value=fact.get("normalized_value") or fact["raw_value"],
+        )
+        duplicate_approved = None
+        if duplicate_match is None:
+            duplicate_approved = find_matching_approved_fact(
+                connection,
+                fund_id=document["fund_id"],
+                fact_category=fact["fact_category"],
+                fact_name=fact["fact_name"],
+                value=fact.get("normalized_value") or fact["raw_value"],
+            )
+        approval_status = "pending"
+        reviewed_by = None
+        reviewed_at = None
+        review_note = None
+        if duplicate_match:
+            approval_status = "rejected"
+            reviewed_by = "system"
+            reviewed_at = now
+            review_note = (
+                f"Auto-rejected exact duplicate of {duplicate_match['approval_status']} fact "
+                f"{duplicate_match['fact_id']} from {duplicate_match['source_document_id']}."
+            )
+        elif duplicate_approved:
+            approval_status = "rejected"
+            reviewed_by = "system"
+            reviewed_at = now
+            review_note = (
+                f"Auto-rejected exact duplicate of approved fact "
+                f"{duplicate_approved['approved_fact_id']} from {duplicate_approved['source_document_id']}."
+            )
         connection.execute(
             """
             INSERT INTO extracted_facts (
                 fact_id, run_id, fund_id, document_id, fact_category, fact_name,
                 raw_value, normalized_value, unit, as_of_date, source_document_id,
                 page_number, quoted_text, structured_payload_json, extraction_method, confidence_score,
-                approval_status, created_at
+                approval_status, reviewed_by, reviewed_at, review_note, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'llm_pdf_text', ?, 'pending', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'llm_pdf_text', ?, ?, ?, ?, ?, ?)
             """,
             (
                 f"fact_{uuid4().hex}",
@@ -264,6 +301,10 @@ def save_extraction_run(connection, document, facts, model_name, raw_output, sco
                 fact["quoted_text"],
                 fact["structured_payload_json"],
                 fact["confidence_score"],
+                approval_status,
+                reviewed_by,
+                reviewed_at,
+                review_note,
                 now,
             ),
         )

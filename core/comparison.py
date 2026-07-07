@@ -1,25 +1,8 @@
 import math
-import statistics
 from collections import defaultdict
 
 from core.db import many, one
-from core.fund_views import build_fund_view
-
-
-def _safe_float(value):
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _round_one(value):
-    numeric = _safe_float(value)
-    if numeric is None:
-        return None
-    return round(numeric, 1)
+from core.fund_views import _round_one, _safe_float, build_fund_view
 
 
 def _tokenize(values):
@@ -103,44 +86,6 @@ def similarity_matrix(connection, fund_ids):
     return matrix
 
 
-def return_statistics(connection, fund_id):
-    rows = many(
-        connection,
-        """
-        SELECT period_type, period_end_date, return_value, return_type, share_class
-        FROM performance_returns
-        WHERE fund_id = ?
-        ORDER BY period_end_date
-        """,
-        (fund_id,),
-    )
-    values = [_safe_float(row["return_value"]) for row in rows]
-    values = [value for value in values if value is not None]
-    if not values:
-        return {
-            "fund_id": fund_id,
-            "return_count": 0,
-            "average_return": None,
-            "volatility": None,
-            "sharpe_like": None,
-            "best_return": None,
-            "worst_return": None,
-        }
-
-    average = statistics.mean(values)
-    volatility = statistics.stdev(values) if len(values) >= 2 else None
-    sharpe_like = average / volatility if volatility and volatility != 0 else None
-    return {
-        "fund_id": fund_id,
-        "return_count": len(values),
-        "average_return": round(average, 4),
-        "volatility": round(volatility, 4) if volatility is not None else None,
-        "sharpe_like": round(sharpe_like, 4) if sharpe_like is not None else None,
-        "best_return": round(max(values), 4),
-        "worst_return": round(min(values), 4),
-    }
-
-
 def aligned_return_comparison(connection, fund_ids):
     if not fund_ids:
         return []
@@ -199,23 +144,6 @@ def aligned_return_comparison(connection, fund_ids):
 
     aligned.sort(key=lambda row: (row["period_end_date"] or "", row.get("share_class") or "", row["period_type"] or ""))
     return aligned
-
-
-def latest_metrics(connection, fund_id):
-    rows = many(
-        connection,
-        """
-        SELECT metric_name, metric_value, raw_value, normalized_value, unit, as_of_date
-        FROM fund_metrics
-        WHERE fund_id = ?
-        ORDER BY metric_name, as_of_date DESC, created_at DESC
-        """,
-        (fund_id,),
-    )
-    latest = {}
-    for row in rows:
-        latest.setdefault(row["metric_name"], row)
-    return latest
 
 
 def data_counts(connection, fund_id):

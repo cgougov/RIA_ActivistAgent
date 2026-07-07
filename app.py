@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -5,25 +6,36 @@ import pandas as pd
 import streamlit as st
 
 from core.analysis import run_snapshot_chat, run_web_research_comparison
-from core.approval import approve_extracted_fact, reject_extracted_fact, reopen_rejected_fact
+from core.approval import (
+    approve_pending_facts,
+)
 from core.comparison import compare_funds
-from core.config import DATA_DIR, DEFAULT_ANALYSIS_MODEL, DEFAULT_REASONING_EFFORT, DB_PATH, PDF_ROOT
+from core.config import (
+    DATA_DIR,
+    DEFAULT_ANALYSIS_MODEL,
+    DEFAULT_REASONING_EFFORT,
+    DB_PATH,
+    PDF_ROOT,
+)
 from core.db import connect_db
 from core.fund_brief import NOT_APPROVED
-from core.fund_views import build_fund_view, build_return_table_previews, format_return_cell
-from core.documents import ingest_document_pages, render_document_page_image, render_document_page_images
-from core.intake import register_pdf_bytes
-from core.promotion import promote_all_pending
-from core.return_rows import (
-    approve_proposed_return_rows,
-    backfill_legacy_return_rows,
-    reject_proposed_return_rows,
+from core.documents import (
+    ingest_document_pages,
+    render_document_page_image,
+    render_document_page_images,
 )
+from core.fund_views import build_fund_view, build_return_table_previews, format_return_cell
+from core.intake import register_pdf_bytes
+from core.promotion import promote_approved_fact_ids
 from core.return_table_extraction import extract_return_table_from_page_image
+from core.taxonomy import RETURN_FACTS
 from core.workbooks import export_analysis_workbook, export_source_truth_workbook
 
 
 st.set_page_config(page_title="Japan Activist Funds", layout="wide")
+
+RETURN_FACT_NAMES = tuple(RETURN_FACTS.keys())
+DEFAULT_RETURN_AUTO_APPROVAL_THRESHOLD = 0.9
 
 st.markdown(
     """
@@ -60,11 +72,9 @@ def data_version():
 
 
 @st.cache_data(show_spinner=False)
-def ensure_return_row_backfill(_version):
+def cached_compare_funds(fund_ids, version):
     with connect_db() as connection:
-        migrated = backfill_legacy_return_rows(connection)
-        connection.commit()
-    return migrated
+        return compare_funds(connection, list(fund_ids))
 
 
 @st.cache_data(show_spinner=False)
@@ -73,18 +83,14 @@ def cached_fund_view(fund_id, version):
         return build_fund_view(connection, fund_id)
 
 
-@st.cache_data(show_spinner=False)
-def cached_compare_funds(fund_ids, version):
-    with connect_db() as connection:
-        return compare_funds(connection, list(fund_ids))
-
-
 def table_view(table_name):
     st.dataframe(query(f"SELECT * FROM {table_name}"), use_container_width=True)
 
 
 def fund_options():
-    return rows("SELECT fund_id, fund_name, manager_name, status FROM funds ORDER BY fund_name")
+    return rows(
+        "SELECT fund_id, fund_name, manager_name, status FROM funds ORDER BY fund_name"
+    )
 
 
 def select_fund(label="Fund"):
@@ -92,7 +98,11 @@ def select_fund(label="Fund"):
     selected = st.selectbox(
         label,
         options=[fund["fund_id"] for fund in funds],
-        format_func=lambda fid: next(f"{fund['fund_name']} ({fund['fund_id']})" for fund in funds if fund["fund_id"] == fid),
+        format_func=lambda fid: next(
+            f"{fund['fund_name']} ({fund['fund_id']})"
+            for fund in funds
+            if fund["fund_id"] == fid
+        ),
     )
     return selected
 
@@ -157,7 +167,11 @@ def render_evidence_panel(fact):
                 connection.commit()
             image_path = page_image_path(image["image_path"])
             if image_path.exists():
-                st.image(str(image_path), caption=f"Page {fact['page_number']} source image", use_container_width=True)
+                st.image(
+                    str(image_path),
+                    caption=f"Page {fact['page_number']} source image",
+                    use_container_width=True,
+                )
         except Exception as exc:
             st.caption(f"Page image unavailable: {exc}")
 
@@ -170,11 +184,19 @@ def render_overview():
     st.subheader("Research Workspace")
     c1, c2, c3, c4, c5, c6 = st.columns(6)
     counts = {}
-    for table in ["funds", "source_documents", "document_pages", "extracted_facts", "approved_facts", "fund_characteristics", "fund_flags"]:
+    for table in [
+        "funds",
+        "source_documents",
+        "document_pages",
+        "extracted_facts",
+        "approved_facts",
+        "fund_characteristics",
+        "fund_flags",
+    ]:
         counts[table] = query(f"SELECT COUNT(*) AS n FROM {table}")["n"].iloc[0]
-    pending_facts = query("SELECT COUNT(*) AS n FROM extracted_facts WHERE approval_status = 'pending'")["n"].iloc[0]
-    pending_returns = query("SELECT COUNT(*) AS n FROM proposed_return_rows WHERE status = 'pending'")["n"].iloc[0]
-    pending_total = pending_facts + pending_returns
+    pending_total = query(
+        "SELECT COUNT(*) AS n FROM extracted_facts WHERE approval_status = 'pending'"
+    )["n"].iloc[0]
     c1.metric("Funds", counts["funds"])
     c2.metric("Documents", counts["source_documents"])
     c3.metric("Pages", counts["document_pages"])
@@ -217,20 +239,6 @@ def render_brief_pairs(pairs):
     )
 
 
-def render_performance_metrics(fund_view):
-    st.subheader("Performance & Risk")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {"Metric": row["label"], "Value": row["value"], "Source": row["source"]}
-                for row in fund_view["performance_rows"]
-            ]
-        ),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
 def render_fund_brief(brief):
     st.subheader("Approved Fund Brief")
 
@@ -257,8 +265,20 @@ def render_fund_brief(brief):
 
     st.markdown("**5. Source-Backed Notes**")
     notes = brief["notes"]
-    st.text_area("Neutral summary", value=notes["neutral_summary"], height=120, disabled=True, key="fund_brief_neutral_summary")
-    st.text_area("Differentiating edge", value=notes["differentiating_edge"], height=120, disabled=True, key="fund_brief_differentiating_edge")
+    st.text_area(
+        "Neutral summary",
+        value=notes["neutral_summary"],
+        height=120,
+        disabled=True,
+        key="fund_brief_neutral_summary",
+    )
+    st.text_area(
+        "Differentiating edge",
+        value=notes["differentiating_edge"],
+        height=120,
+        disabled=True,
+        key="fund_brief_differentiating_edge",
+    )
     flags = notes["flags"] or [NOT_APPROVED]
     st.dataframe(
         pd.DataFrame([{"Flags / Missing disclosures": value} for value in flags]),
@@ -267,25 +287,37 @@ def render_fund_brief(brief):
     )
 
 
-def render_approved_returns_section(fund_view):
+def _render_return_table_previews(previews, *, key_prefix):
+    for index, preview in enumerate(previews):
+        heading = preview.get("display_name") or preview["table_name"]
+        st.markdown(f"**{heading}**")
+        preview_df = pd.DataFrame(index=preview["row_order"], columns=preview["column_order"])
+        for (row_label, column_label), value in preview["values"].items():
+            preview_df.loc[row_label, column_label] = format_return_cell(value)
+        st.dataframe(
+            preview_df.fillna(""),
+            use_container_width=True,
+        )
+
+
+def render_approved_returns_section(view):
     st.subheader("Approved Returns")
-    snapshot = fund_view["snapshot"]
-    returns_df = pd.DataFrame(snapshot["returns"])
+    performance_rows = pd.DataFrame(view["performance_rows"])
+    if not performance_rows.empty:
+        st.dataframe(performance_rows, use_container_width=True, hide_index=True)
+
+    returns_df = pd.DataFrame(view["snapshot"]["returns"])
     if returns_df.empty:
-        st.info("No approved structured return rows yet. Use the Returns tab to extract rows from factsheet page images, then approve and promote them.")
+        st.info(
+            "No approved structured return rows yet. Use the Returns tab to extract rows from factsheet page images, then approve and promote them."
+        )
         return
 
-    previews = fund_view["return_table_previews"]
+    previews = view["return_table_previews"]
     if previews:
-        for preview in previews:
-            heading = preview.get("display_name") or preview["table_name"]
-            st.caption(heading)
-            preview_df = pd.DataFrame(index=preview["row_order"], columns=preview["column_order"])
-            for (row_label, column_label), value in preview["values"].items():
-                preview_df.loc[row_label, column_label] = format_return_cell(value)
-            preview_df.index.name = "Row"
-            st.dataframe(preview_df, use_container_width=True)
+        _render_return_table_previews(previews, key_prefix="funds")
 
+    st.caption("Approved structured return rows")
     display_columns = [
         "share_class",
         "period_type",
@@ -293,29 +325,12 @@ def render_approved_returns_section(fund_view):
         "period_end_date",
         "return_type",
         "return_value",
-        "return_value_bps",
         "unit",
-        "evidence_text",
         "source_document_id",
         "page_number",
     ]
-    st.dataframe(returns_df[display_columns], use_container_width=True, hide_index=True)
-
-    values = pd.to_numeric(returns_df["return_value"], errors="coerce").dropna()
-    if len(values) >= 2:
-        stat_cols = st.columns(4)
-        stats = fund_view["calculated_return_statistics"]
-        stat_cols[0].metric("Return rows", stats["return_count"])
-        stat_cols[1].metric("Average return", f"{stats['average_return']:.1f}%" if stats["average_return"] is not None else "No approved value")
-        stat_cols[2].metric("Volatility", fund_view["performance_rows"][3]["value"])
-        stat_cols[3].metric(
-            "Best / worst",
-            f"{stats['best_return']:.1f}% / {stats['worst_return']:.1f}%"
-            if stats["best_return"] is not None and stats["worst_return"] is not None
-            else "No approved value",
-        )
-    else:
-        st.caption("At least two approved return rows are needed for volatility and basic return statistics.")
+    available_columns = [column for column in display_columns if column in returns_df.columns]
+    st.dataframe(returns_df[available_columns], use_container_width=True, hide_index=True)
 
 
 def fund_name_lookup(funds):
@@ -327,9 +342,15 @@ def with_fund_names(df, name_by_id):
         return df
     renamed = df.copy()
     if "fund_id" in renamed.columns:
-        renamed["fund_id"] = renamed["fund_id"].map(lambda value: name_by_id.get(value, value))
+        renamed["fund_id"] = renamed["fund_id"].map(
+            lambda value: name_by_id.get(value, value)
+        )
         renamed = renamed.rename(columns={"fund_id": "Fund"})
-    renamed = renamed.rename(columns={key: value for key, value in name_by_id.items() if key in renamed.columns})
+    renamed = renamed.rename(
+        columns={
+            key: value for key, value in name_by_id.items() if key in renamed.columns
+        }
+    )
     renamed = renamed.rename(
         columns={
             column: column.replace("_", " ")
@@ -339,7 +360,9 @@ def with_fund_names(df, name_by_id):
     )
     renamed = renamed.rename(
         columns={
-            column: " minus ".join(name_by_id.get(part, part) for part in column.split("_minus_"))
+            column: " minus ".join(
+                name_by_id.get(part, part) for part in column.split("_minus_")
+            )
             for column in renamed.columns
             if "_minus_" in column
         }
@@ -349,27 +372,15 @@ def with_fund_names(df, name_by_id):
 
 def render_fund_explorer():
     st.subheader("Fund Explorer")
-    funds_df = query("SELECT fund_id, fund_name, manager_name, base_currency, inception_date, primary_strategy FROM funds ORDER BY fund_name")
+    funds_df = query(
+        "SELECT fund_id, fund_name, manager_name, base_currency, inception_date, primary_strategy FROM funds ORDER BY fund_name"
+    )
     if funds_df.empty:
         st.info("No funds available.")
         return
 
     pending_df = query(
-        """
-        SELECT fund_id, SUM(pending_count) AS pending_review
-        FROM (
-            SELECT fund_id, COUNT(*) AS pending_count
-            FROM extracted_facts
-            WHERE approval_status = 'pending'
-            GROUP BY fund_id
-            UNION ALL
-            SELECT fund_id, COUNT(*) AS pending_count
-            FROM proposed_return_rows
-            WHERE status = 'pending'
-            GROUP BY fund_id
-        )
-        GROUP BY fund_id
-        """
+        "SELECT fund_id, COUNT(*) AS pending_review FROM extracted_facts WHERE approval_status = 'pending' GROUP BY fund_id"
     )
     funds_df = funds_df.merge(pending_df, on="fund_id", how="left")
     funds_df["pending_review"] = funds_df["pending_review"].fillna(0).astype(int)
@@ -377,44 +388,63 @@ def render_fund_explorer():
     selected = st.selectbox(
         "Open fund",
         options=funds_df["fund_id"].tolist(),
-        format_func=lambda fid: funds_df.loc[funds_df["fund_id"] == fid, "fund_name"].iloc[0],
+        format_func=lambda fid: funds_df.loc[
+            funds_df["fund_id"] == fid, "fund_name"
+        ].iloc[0],
         key="funds_open_fund",
     )
 
-    fund_view = cached_fund_view(selected, data_version())
-    snapshot = fund_view["snapshot"]
-
+    view = cached_fund_view(selected, data_version())
+    snapshot = view["snapshot"]
     fund = snapshot["fund"]
-    brief = fund_view["brief"]
     st.header(fund["fund_name"])
-    pending_for_fund = int(funds_df.loc[funds_df["fund_id"] == selected, "pending_review"].iloc[0])
+    pending_for_fund = int(
+        funds_df.loc[funds_df["fund_id"] == selected, "pending_review"].iloc[0]
+    )
     if pending_for_fund:
-        st.warning(f"Needs review: {pending_for_fund} pending fact(s) awaiting approval.")
+        st.warning(
+            f"Needs review: {pending_for_fund} pending fact(s) awaiting approval."
+        )
     else:
         st.caption("No pending facts awaiting approval for this fund.")
 
-    render_fund_brief(brief)
-    render_performance_metrics(fund_view)
-    render_approved_returns_section(fund_view)
+    render_fund_brief(view["brief"])
+    render_approved_returns_section(view)
 
     st.divider()
     with st.expander("Browse / Filter Funds", expanded=False):
-        search = st.text_input("Filter funds", placeholder="Type fund, manager, or strategy", key="funds_filter")
+        search = st.text_input(
+            "Filter funds",
+            placeholder="Type fund, manager, or strategy",
+            key="funds_filter",
+        )
         browse_df = funds_df
         if search:
-            mask = browse_df.astype(str).apply(lambda col: col.str.contains(search, case=False, na=False)).any(axis=1)
+            mask = (
+                browse_df.astype(str)
+                .apply(lambda col: col.str.contains(search, case=False, na=False))
+                .any(axis=1)
+            )
             browse_df = browse_df[mask]
-        st.dataframe(browse_df.drop(columns=["fund_id"]), use_container_width=True, hide_index=True)
+        st.dataframe(
+            browse_df.drop(columns=["fund_id"]),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.subheader("Approved Raw Tables")
     with st.expander("Approved Characteristics Tree", expanded=False):
-        st.dataframe(pd.DataFrame(snapshot["characteristics"]), use_container_width=True)
+        st.dataframe(
+            pd.DataFrame(snapshot["characteristics"]), use_container_width=True
+        )
     with st.expander("Neutral Writeups", expanded=False):
         st.dataframe(pd.DataFrame(snapshot["writeups"]), use_container_width=True)
     with st.expander("Flags", expanded=False):
         st.dataframe(pd.DataFrame(snapshot["flags"]), use_container_width=True)
     with st.expander("Profile Attributes", expanded=False):
-        st.dataframe(pd.DataFrame(snapshot["profile_attributes"]), use_container_width=True)
+        st.dataframe(
+            pd.DataFrame(snapshot["profile_attributes"]), use_container_width=True
+        )
     with st.expander("Terms", expanded=False):
         st.dataframe(pd.DataFrame(snapshot["terms"]), use_container_width=True)
     with st.expander("Strategy / Exposure", expanded=False):
@@ -428,47 +458,124 @@ def render_fund_explorer():
     with st.expander("Raw FundSnapshot JSON", expanded=False):
         st.json(snapshot, expanded=False)
 
+
+def _parse_structured_payload(payload_text):
+    if not payload_text:
+        return {}
+    try:
+        return json.loads(payload_text)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+
 def _return_table_review_rows(document_id):
+    placeholders = ", ".join(["?"] * len(RETURN_FACT_NAMES))
     return rows(
-        """
-        SELECT pr.*, er.model_name
-        FROM proposed_return_rows pr
+        f"""
+        SELECT ef.fact_id, ef.fact_name, ef.raw_value, ef.normalized_value, ef.unit, ef.as_of_date,
+               ef.page_number, ef.quoted_text, ef.structured_payload_json, ef.confidence_score,
+               ef.created_at, er.model_name
+        FROM extracted_facts ef
         LEFT JOIN extraction_runs er
-            ON er.run_id = pr.run_id
-        WHERE pr.source_document_id = ?
-          AND pr.status = 'pending'
-        ORDER BY pr.period_end_date, pr.share_class, pr.table_name, pr.row_label, pr.column_label
+            ON er.run_id = ef.run_id
+        WHERE ef.source_document_id = ?
+          AND ef.approval_status = 'pending'
+          AND ef.fact_category = 'performance'
+          AND ef.fact_name IN ({placeholders})
+          AND ef.extraction_method IN ('llm_pdf_page_image', 'csv_import')
+        ORDER BY ef.created_at DESC, ef.page_number, ef.fact_name
         """,
-        [document_id],
+        [document_id, *RETURN_FACT_NAMES],
     )
 
 
 def _build_return_review_dataframe(pending_rows):
     display_rows = []
     for row in pending_rows:
+        payload = _parse_structured_payload(row.get("structured_payload_json"))
+        context = payload.get("structured_context") or {}
         display_rows.append(
             {
-                "proposed_row_id": row["proposed_row_id"],
-                "share_class": row["share_class"],
-                "period_type": row["period_type"],
-                "period_start_date": row["period_start_date"],
-                "period_end_date": row["period_end_date"],
-                "return_type": row["return_type"],
-                "return_value": row["return_value"],
-                "return_value_bps": row["return_value_bps"],
-                "unit": row["unit"],
-                "table_name": row["table_name"],
-                "row_label": row["row_label"],
-                "column_label": row["column_label"],
-                "evidence_text": row["evidence_text"],
-                "status": row["status"],
+                "fact_id": row["fact_id"],
+                "confidence_score": row["confidence_score"],
+                "share_class": payload.get("share_class"),
+                "period_type": payload.get("period_type")
+                or RETURN_FACTS.get(row["fact_name"]),
+                "period_start_date": payload.get("period_start_date"),
+                "period_end_date": payload.get("period_end_date") or row["as_of_date"],
+                "return_type": payload.get("return_type") or "unknown",
+                "return_value": payload.get("return_value") or row["raw_value"],
+                "unit": payload.get("unit") or row["unit"],
+                "table_name": context.get("table_name"),
+                "row_label": context.get("row_label"),
+                "column_label": context.get("column_label"),
+                "quoted_text": row["quoted_text"],
                 "model_name": row["model_name"],
                 "created_at": row["created_at"],
             }
         )
     return pd.DataFrame(display_rows)
 
-def _run_return_table_extraction(doc_id, page_number, dpi, mock):
+
+def _eligible_auto_approve_return_fact_ids(connection, run_id, confidence_threshold):
+    candidates = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT fact_id, fact_name, confidence_score, structured_payload_json
+            FROM extracted_facts
+            WHERE run_id = ?
+              AND approval_status = 'pending'
+              AND fact_category = 'performance'
+              AND fact_name IN ('monthly_return', 'quarterly_return', 'annual_return', 'ytd_return')
+            ORDER BY created_at
+            """,
+            (run_id,),
+        ).fetchall()
+    ]
+    eligible = []
+    held_back = []
+    for row in candidates:
+        payload = _parse_structured_payload(row["structured_payload_json"])
+        expected_period_type = RETURN_FACTS.get(row["fact_name"])
+        confidence_score = row.get("confidence_score")
+        if confidence_score is None or confidence_score < confidence_threshold:
+            held_back.append((row["fact_id"], "below confidence threshold"))
+            continue
+        if payload.get("period_type") != expected_period_type:
+            held_back.append((row["fact_id"], "period_type mismatch"))
+            continue
+        if not payload.get("period_end_date"):
+            held_back.append((row["fact_id"], "missing period_end_date"))
+            continue
+        if payload.get("return_value") in (None, ""):
+            held_back.append((row["fact_id"], "missing return_value"))
+            continue
+        eligible.append(row["fact_id"])
+    return eligible, held_back
+
+
+def _approve_and_promote_return_fact_ids(connection, fact_ids, reviewer, note):
+    approved_fact_ids = approve_pending_facts(
+        connection,
+        fact_ids,
+        reviewer=reviewer,
+        note=note,
+    )
+    promoted, skipped = promote_approved_fact_ids(
+        connection, approved_fact_ids, user=reviewer
+    )
+    return approved_fact_ids, promoted, skipped
+
+
+def _run_return_table_extraction(
+    doc_id,
+    page_number,
+    dpi,
+    mock,
+    auto_approve=False,
+    confidence_threshold=DEFAULT_RETURN_AUTO_APPROVAL_THRESHOLD,
+):
     try:
         with connect_db() as connection:
             run_id, inserted, skipped = extract_return_table_from_page_image(
@@ -478,11 +585,59 @@ def _run_return_table_extraction(doc_id, page_number, dpi, mock):
                 dpi=int(dpi),
                 mock=mock,
             )
+            auto_approved = []
+            held_back = []
+            promoted = []
+            promotion_skips = []
+            if auto_approve:
+                eligible_ids, held_back = _eligible_auto_approve_return_fact_ids(
+                    connection, run_id, confidence_threshold
+                )
+                auto_approved, promoted, promotion_skips = (
+                    _approve_and_promote_return_fact_ids(
+                        connection,
+                        eligible_ids,
+                        reviewer="returns_auto",
+                        note=f"Auto-approved structured return row at confidence >= {confidence_threshold:.2f}.",
+                    )
+                )
             connection.commit()
         label = "Mock created" if mock else "Created"
-        st.success(f"{label} {inserted} proposed return row(s). Review run: {run_id}")
+        st.success(
+            f"{label} {inserted} pending return row fact(s). Review run: {run_id}"
+        )
+        if auto_approve:
+            st.info(
+                f"Auto-approved {len(auto_approved)} high-confidence row(s) and promoted {len(promoted)} row(s) into approved return history."
+            )
+            if held_back:
+                st.caption(f"{len(held_back)} row(s) stayed pending for table review.")
+                st.dataframe(
+                    pd.DataFrame(held_back, columns=["fact_id", "held_back_reason"]),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            if promotion_skips:
+                st.warning(
+                    f"{len(promotion_skips)} auto-approved row(s) were not promotable yet."
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        promotion_skips,
+                        columns=[
+                            "approved_fact_id",
+                            "fact_category",
+                            "fact_name",
+                            "reason",
+                        ],
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
         if skipped:
-            st.warning(f"{len(skipped)} row(s) from the model were skipped — review reasons below.")
+            st.warning(
+                f"{len(skipped)} row(s) from the model were skipped — review reasons below."
+            )
             st.dataframe(
                 pd.DataFrame(skipped, columns=["row_index", "reason"]),
                 use_container_width=True,
@@ -492,12 +647,52 @@ def _run_return_table_extraction(doc_id, page_number, dpi, mock):
         st.error(f"Return extraction failed: {exc}")
 
 
-def render_return_extraction_controls(doc_id, page_number, dpi, key_prefix, disabled=False):
+def render_return_extraction_controls(
+    doc_id, page_number, dpi, key_prefix, disabled=False
+):
+    settings = st.columns([1.1, 1])
+    auto_approve = settings[0].checkbox(
+        "Auto-approve strong structured rows",
+        value=True,
+        key=f"{key_prefix}_auto_approve_returns",
+        disabled=disabled,
+    )
+    confidence_threshold = settings[1].slider(
+        "Confidence threshold",
+        min_value=0.5,
+        max_value=1.0,
+        value=DEFAULT_RETURN_AUTO_APPROVAL_THRESHOLD,
+        step=0.05,
+        key=f"{key_prefix}_auto_approve_threshold",
+        disabled=disabled or not auto_approve,
+    )
     cols = st.columns(2)
-    if cols[0].button("Extract return table from page image", key=f"{key_prefix}_extract_return_table", disabled=disabled):
-        _run_return_table_extraction(doc_id, page_number, dpi, mock=False)
-    if cols[1].button("Mock visual return extraction (no API call)", key=f"{key_prefix}_mock_visual_return_extraction", disabled=disabled):
-        _run_return_table_extraction(doc_id, page_number, dpi, mock=True)
+    if cols[0].button(
+        "Extract return table from page image",
+        key=f"{key_prefix}_extract_return_table",
+        disabled=disabled,
+    ):
+        _run_return_table_extraction(
+            doc_id,
+            page_number,
+            dpi,
+            mock=False,
+            auto_approve=auto_approve,
+            confidence_threshold=confidence_threshold,
+        )
+    if cols[1].button(
+        "Mock visual return extraction (no API call)",
+        key=f"{key_prefix}_mock_visual_return_extraction",
+        disabled=disabled,
+    ):
+        _run_return_table_extraction(
+            doc_id,
+            page_number,
+            dpi,
+            mock=True,
+            auto_approve=auto_approve,
+            confidence_threshold=confidence_threshold,
+        )
 
 
 def render_returns_workspace():
@@ -515,7 +710,9 @@ def render_returns_workspace():
     selected_fund = st.selectbox(
         "Fund",
         options=[fund["fund_id"] for fund in funds],
-        format_func=lambda fid: next(f"{fund['fund_name']} ({fid})" for fund in funds if fund["fund_id"] == fid),
+        format_func=lambda fid: next(
+            f"{fund['fund_name']} ({fid})" for fund in funds if fund["fund_id"] == fid
+        ),
         key="returns_fund",
     )
     documents = rows(
@@ -541,15 +738,33 @@ def render_returns_workspace():
         ),
         key="returns_document",
     )
-    document = next(document for document in documents if document["document_id"] == selected_doc)
+    document = next(
+        document for document in documents if document["document_id"] == selected_doc
+    )
     max_page = int(document["page_count"] or 1)
     controls = st.columns([1, 1, 1])
-    page_number = controls[0].number_input("Page number", min_value=1, max_value=max_page, value=1, step=1, key="returns_page_number")
-    dpi = controls[1].number_input("Render DPI", min_value=100, max_value=300, value=180, step=20, key="returns_render_dpi")
+    page_number = controls[0].number_input(
+        "Page number",
+        min_value=1,
+        max_value=max_page,
+        value=1,
+        step=1,
+        key="returns_page_number",
+    )
+    dpi = controls[1].number_input(
+        "Render DPI",
+        min_value=100,
+        max_value=300,
+        value=180,
+        step=20,
+        key="returns_render_dpi",
+    )
     image = None
     if controls[2].button("Render page image", key="returns_render_page_image"):
         with connect_db() as connection:
-            image = render_document_page_image(connection, selected_doc, int(page_number), dpi=int(dpi))
+            image = render_document_page_image(
+                connection, selected_doc, int(page_number), dpi=int(dpi)
+            )
             connection.commit()
         st.success(f"Rendered page {int(page_number)} for {selected_doc}.")
     else:
@@ -568,13 +783,21 @@ def render_returns_workspace():
     if image:
         image_path = page_image_path(image["image_path"])
         if image_path.exists():
-            st.image(str(image_path), caption=f"{selected_doc} page {int(page_number)}", use_container_width=True)
+            st.image(
+                str(image_path),
+                caption=f"{selected_doc} page {int(page_number)}",
+                use_container_width=True,
+            )
     else:
         st.info("Render the page image before extracting return rows.")
 
     st.markdown("**Extract Structured Return Rows**")
-    st.caption("Returns stay in this workflow and do not go through the generic one-by-one fund-facts queue.")
-    render_return_extraction_controls(selected_doc, page_number, dpi, "returns", disabled=image is None)
+    st.caption(
+        "Returns stay in this workflow and do not go through the generic one-by-one fund-facts queue."
+    )
+    render_return_extraction_controls(
+        selected_doc, page_number, dpi, "returns", disabled=image is None
+    )
 
     pending_rows = _return_table_review_rows(selected_doc)
     pending = _build_return_review_dataframe(pending_rows)
@@ -582,87 +805,121 @@ def render_returns_workspace():
     if pending.empty:
         st.info("No pending return rows for this document.")
     else:
-        reviewer = st.text_input("Return reviewer", value="christian", key="returns_reviewer")
-        previews = build_return_table_previews(pending_rows)
-        if previews:
-            st.markdown("**Extracted Table Preview**")
-            for preview in previews:
-                heading = preview.get("display_name") or preview["table_name"]
-                st.caption(heading)
-                preview_df = pd.DataFrame(index=preview["row_order"], columns=preview["column_order"])
-                for (row_label, column_label), value in preview["values"].items():
-                    preview_df.loc[row_label, column_label] = format_return_cell(value)
-                preview_df.index.name = "Row"
-                st.dataframe(preview_df, use_container_width=True)
-
-        action_cols = st.columns(3)
-        if action_cols[0].button("Approve all pending rows for this document", key="returns_approve_all_pending"):
+        pending_previews = build_return_table_previews(pending.to_dict("records"))
+        if pending_previews:
+            _render_return_table_previews(pending_previews, key_prefix="returns_pending")
+        reviewer = st.text_input(
+            "Return reviewer", value="christian", key="returns_reviewer"
+        )
+        action_cols = st.columns(2)
+        if action_cols[0].button(
+            "Approve all pending rows for this document",
+            key="returns_approve_all_pending",
+        ):
             with connect_db() as connection:
-                approved_fact_ids, promoted, promotion_skips = approve_proposed_return_rows(
-                    connection,
-                    [row["proposed_row_id"] for row in pending_rows],
-                    reviewer=reviewer,
-                    note=f"Bulk-approved from Returns workspace for document {selected_doc}.",
+                approved_fact_ids, promoted, promotion_skips = (
+                    _approve_and_promote_return_fact_ids(
+                        connection,
+                        [row["fact_id"] for row in pending_rows],
+                        reviewer=reviewer,
+                        note=f"Bulk-approved from Returns workspace for document {selected_doc}.",
+                    )
                 )
                 connection.commit()
             st.success(
                 f"Approved {len(approved_fact_ids)} row(s) and promoted {len(promoted)} row(s) into approved return history."
             )
             if promotion_skips:
-                st.warning(f"{len(promotion_skips)} approved row(s) could not be promoted.")
+                st.warning(
+                    f"{len(promotion_skips)} approved row(s) could not be promoted."
+                )
                 st.dataframe(
-                    pd.DataFrame(promotion_skips, columns=["approved_fact_id", "fact_category", "fact_name", "reason"]),
+                    pd.DataFrame(
+                        promotion_skips,
+                        columns=[
+                            "approved_fact_id",
+                            "fact_category",
+                            "fact_name",
+                            "reason",
+                        ],
+                    ),
                     use_container_width=True,
                     hide_index=True,
                 )
             st.rerun()
-        if action_cols[1].button("Reject all pending rows for this document", key="returns_reject_all_pending"):
+        if action_cols[1].button(
+            "Auto-approve displayed rows above threshold",
+            key="returns_auto_approve_pending",
+        ):
+            threshold = st.session_state.get(
+                "returns_auto_approve_threshold", DEFAULT_RETURN_AUTO_APPROVAL_THRESHOLD
+            )
+            eligible_ids = []
+            for row in pending_rows:
+                payload = _parse_structured_payload(row.get("structured_payload_json"))
+                expected_period_type = RETURN_FACTS.get(row["fact_name"])
+                if (
+                    row.get("confidence_score") is None
+                    or row["confidence_score"] < threshold
+                ):
+                    continue
+                if payload.get("period_type") != expected_period_type:
+                    continue
+                if not payload.get("period_end_date"):
+                    continue
+                if payload.get("return_value") in (None, ""):
+                    continue
+                eligible_ids.append(row["fact_id"])
             with connect_db() as connection:
-                reject_proposed_return_rows(
-                    connection,
-                    [row["proposed_row_id"] for row in pending_rows],
-                    reviewer=reviewer,
-                    note=f"Bulk-rejected from Returns workspace for document {selected_doc}.",
+                approved_fact_ids, promoted, promotion_skips = (
+                    _approve_and_promote_return_fact_ids(
+                        connection,
+                        eligible_ids,
+                        reviewer="returns_auto",
+                        note=f"Auto-approved from Returns workspace at confidence >= {threshold:.2f}.",
+                    )
                 )
                 connection.commit()
-            st.success(f"Rejected {len(pending_rows)} pending row(s) for this document.")
+            st.success(
+                f"Auto-approved {len(approved_fact_ids)} row(s) and promoted {len(promoted)} row(s) into approved return history."
+            )
+            if promotion_skips:
+                st.warning(
+                    f"{len(promotion_skips)} auto-approved row(s) could not be promoted."
+                )
+                st.dataframe(
+                    pd.DataFrame(
+                        promotion_skips,
+                        columns=[
+                            "approved_fact_id",
+                            "fact_category",
+                            "fact_name",
+                            "reason",
+                        ],
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
             st.rerun()
-        action_cols[2].caption("Rows stay ordered by period end date so review format remains stable before and after approval.")
-        st.dataframe(pending, use_container_width=True, hide_index=True)
+        with st.expander("Pending row details", expanded=False):
+            st.dataframe(pending, use_container_width=True, hide_index=True)
 
     approved = query(
         """
         SELECT share_class, period_type, period_start_date, period_end_date,
-               return_type, return_value, return_value_bps, unit, evidence_text, source_document_id, page_number
+               return_type, return_value, unit, source_document_id, page_number
         FROM performance_returns
         WHERE fund_id = ?
-        ORDER BY period_end_date, period_type, share_class
+        ORDER BY period_end_date DESC, period_type, share_class
         """,
         [selected_fund],
     )
     st.markdown("**Approved Promoted Return History**")
-    approved_rows = rows(
-        """
-        SELECT share_class, period_type, period_start_date, period_end_date, return_type,
-               return_value, return_value_bps, unit, evidence_text, table_name, row_label, column_label
-        FROM proposed_return_rows
-        WHERE fund_id = ?
-          AND status = 'approved'
-        ORDER BY period_end_date, period_type, share_class
-        """,
-        [selected_fund],
-    )
-    approved_previews = build_return_table_previews(approved_rows)
+    approved_previews = build_return_table_previews(approved.to_dict("records"))
     if approved_previews:
-        for preview in approved_previews:
-            heading = preview.get("display_name") or preview["table_name"]
-            st.caption(heading)
-            preview_df = pd.DataFrame(index=preview["row_order"], columns=preview["column_order"])
-            for (row_label, column_label), value in preview["values"].items():
-                preview_df.loc[row_label, column_label] = format_return_cell(value)
-            preview_df.index.name = "Row"
-            st.dataframe(preview_df, use_container_width=True)
-    st.dataframe(approved, use_container_width=True, hide_index=True)
+        _render_return_table_previews(approved_previews, key_prefix="returns_approved")
+    with st.expander("Approved row details", expanded=False):
+        st.dataframe(approved, use_container_width=True, hide_index=True)
 
 
 def render_document_intake():
@@ -670,27 +927,50 @@ def render_document_intake():
     funds = rows("SELECT fund_id, fund_name FROM funds ORDER BY fund_id")
     fund_options = [""] + [fund["fund_id"] for fund in funds]
     fund_labels = {"": "Unassigned / public source"}
-    fund_labels.update({fund["fund_id"]: f"{fund['fund_id']} - {fund['fund_name']}" for fund in funds})
+    fund_labels.update(
+        {fund["fund_id"]: f"{fund['fund_id']} - {fund['fund_name']}" for fund in funds}
+    )
 
     uploaded = st.file_uploader("Upload PDF", type=["pdf"], key="intake_upload_pdf")
     col1, col2 = st.columns(2)
     with col1:
-        fund_id = st.selectbox("Fund", fund_options, format_func=lambda fid: fund_labels[fid], key="intake_fund")
+        fund_id = st.selectbox(
+            "Fund",
+            fund_options,
+            format_func=lambda fid: fund_labels[fid],
+            key="intake_fund",
+        )
         document_type = st.selectbox(
             "Document type",
             ["factsheet", "presentation", "other"],
             key="intake_document_type",
         )
-        document_date = st.text_input("Document date", placeholder="YYYY-MM-DD if known", key="intake_document_date")
+        document_date = st.text_input(
+            "Document date",
+            placeholder="YYYY-MM-DD if known",
+            key="intake_document_date",
+        )
     with col2:
         document_title = st.text_input("Document title", key="intake_document_title")
-        confidentiality_level = st.selectbox("Confidentiality", ["internal", "restricted", "public"], key="intake_confidentiality")
-        uploaded_by = st.text_input("Uploaded by", value="christian", key="intake_uploaded_by")
+        confidentiality_level = st.selectbox(
+            "Confidentiality",
+            ["internal", "restricted", "public"],
+            key="intake_confidentiality",
+        )
+        uploaded_by = st.text_input(
+            "Uploaded by", value="christian", key="intake_uploaded_by"
+        )
 
     notes = st.text_area("Notes", key="intake_notes")
-    ingest_now = st.checkbox("Ingest pages immediately", value=True, key="intake_ingest_now")
+    ingest_now = st.checkbox(
+        "Ingest pages immediately", value=True, key="intake_ingest_now"
+    )
 
-    if st.button("Register PDF", disabled=uploaded is None or not document_title, key="intake_register_pdf"):
+    if st.button(
+        "Register PDF",
+        disabled=uploaded is None or not document_title,
+        key="intake_register_pdf",
+    ):
         with connect_db() as connection:
             result = register_pdf_bytes(
                 connection,
@@ -715,100 +995,6 @@ def render_document_intake():
     table_view("document_classification_suggestions")
 
 
-def render_approval_queue():
-    pending = rows(
-        """
-        SELECT
-            ef.*,
-            f.fund_name,
-            sd.document_title,
-            sd.file_name
-        FROM extracted_facts ef
-        JOIN funds f ON f.fund_id = ef.fund_id
-        JOIN source_documents sd ON sd.document_id = ef.source_document_id
-        WHERE ef.approval_status = 'pending'
-          AND NOT (
-              ef.fact_category = 'performance'
-              AND ef.fact_name IN ('monthly_return', 'quarterly_return', 'annual_return', 'ytd_return')
-          )
-        ORDER BY ef.created_at, ef.fact_category, ef.fact_name
-        """
-    )
-    st.subheader(f"Pending Facts ({len(pending)})")
-    st.caption("Structured return rows are reviewed in the Returns tab as a table-first workflow.")
-    reviewer = st.text_input("Reviewer", value="christian", key="approval_queue_reviewer")
-
-    if not pending:
-        st.info("No pending facts.")
-        return
-
-    for fact in pending:
-        with st.container(border=True):
-            st.markdown(f"**{fact['fund_name']}** · `{fact['fact_category']}.{fact['fact_name']}`")
-            st.caption(f"{fact['document_title']} · page {fact['page_number'] or 'unknown'}")
-            cols = st.columns([1, 1])
-            with cols[0]:
-                approved_value = st.text_input(
-                    "Approved value",
-                    value=fact["raw_value"],
-                    key=f"value_{fact['fact_id']}",
-                )
-                normalized_value = st.text_input(
-                    "Normalized value",
-                    value=fact["normalized_value"] or fact["raw_value"],
-                    key=f"norm_{fact['fact_id']}",
-                )
-                note = st.text_input("Review note", key=f"note_{fact['fact_id']}")
-                a, r = st.columns(2)
-                if a.button("Approve", key=f"approve_{fact['fact_id']}"):
-                    with connect_db() as connection:
-                        approve_extracted_fact(
-                            connection,
-                            fact["fact_id"],
-                            approved_value,
-                            normalized_value,
-                            reviewer,
-                            note,
-                        )
-                        connection.commit()
-                    st.rerun()
-                if r.button("Reject", key=f"reject_{fact['fact_id']}"):
-                    with connect_db() as connection:
-                        reject_extracted_fact(connection, fact["fact_id"], reviewer, note)
-                        connection.commit()
-                    st.rerun()
-            with cols[1]:
-                render_evidence_panel(fact)
-
-
-def render_promotion():
-    st.subheader("Approved Fact Promotion")
-    last_skips = st.session_state.pop("last_promotion_skips", None)
-    if last_skips:
-        st.warning(f"{len(last_skips)} approved fact(s) were skipped during the last promotion run.")
-        st.dataframe(
-            pd.DataFrame(last_skips, columns=["approved_fact_id", "fact_category", "fact_name", "reason"]),
-            use_container_width=True,
-            hide_index=True,
-        )
-    approved = query(
-        """
-        SELECT approved_fact_id, fund_id, fact_category, fact_name, approved_value,
-               promotion_status, promoted_to_table, promoted_at
-        FROM approved_facts
-        ORDER BY approved_at DESC
-        """
-    )
-    st.dataframe(approved, use_container_width=True)
-    if st.button("Promote pending approved facts", key="promotion_promote_pending"):
-        with connect_db() as connection:
-            promoted, skipped = promote_all_pending(connection, user="streamlit")
-            connection.commit()
-        st.session_state["last_promotion_skips"] = skipped
-        st.success(f"Promoted {len(promoted)} facts; skipped {len(skipped)}.")
-        st.rerun()
-
-
 def render_clean_tables():
     tables = [
         "funds",
@@ -817,7 +1003,6 @@ def render_clean_tables():
         "fund_people",
         "fund_terms",
         "fund_strategy",
-        "proposed_return_rows",
         "performance_returns",
         "benchmark_returns",
         "fund_metrics",
@@ -839,15 +1024,29 @@ def render_documents():
     doc_id = st.text_input("Document ID", value="doc_003", key="documents_doc_id")
     if doc_id:
         page_controls = st.columns([1, 1, 1])
-        page_number = page_controls[0].number_input("Page", min_value=1, value=1, step=1, key="documents_page_number")
-        dpi = page_controls[1].number_input("Render DPI", min_value=100, max_value=300, value=180, step=20, key="documents_render_dpi")
-        if page_controls[2].button("Render page image", key="documents_render_page_image"):
+        page_number = page_controls[0].number_input(
+            "Page", min_value=1, value=1, step=1, key="documents_page_number"
+        )
+        dpi = page_controls[1].number_input(
+            "Render DPI",
+            min_value=100,
+            max_value=300,
+            value=180,
+            step=20,
+            key="documents_render_dpi",
+        )
+        if page_controls[2].button(
+            "Render page image", key="documents_render_page_image"
+        ):
             with connect_db() as connection:
-                images = render_document_page_images(connection, doc_id, pages=[int(page_number)], dpi=int(dpi))
+                images = render_document_page_images(
+                    connection, doc_id, pages=[int(page_number)], dpi=int(dpi)
+                )
                 connection.commit()
             st.success(f"Rendered {len(images)} page image(s).")
-
-        render_return_extraction_controls(doc_id, page_number, dpi, "documents")
+        st.caption(
+            "Use the Returns tab for structured return extraction and review. This view stays focused on raw document/page audit."
+        )
 
         pages = query(
             "SELECT page_number, extraction_status, substr(page_text, 1, 1000) AS page_text_preview FROM document_pages WHERE document_id = ? ORDER BY page_number",
@@ -874,105 +1073,19 @@ def render_conflicts():
     st.dataframe(conflicts, use_container_width=True)
 
 
-def render_fact_admin():
-    st.subheader("Rejected Fact Admin")
-    st.caption("Reopen a rejected proposed fact for another pass through the normal approval queue.")
-
-    doc_filter = st.text_input("Optional document ID filter", value="", placeholder="doc_003", key="fact_admin_doc_filter")
-    params = []
-    where = "WHERE ef.approval_status = 'rejected'"
-    if doc_filter.strip():
-        where += " AND ef.source_document_id = ?"
-        params.append(doc_filter.strip())
-
-    rejected = rows(
-        f"""
-        SELECT
-            ef.*,
-            f.fund_name,
-            sd.document_title,
-            sd.file_name
-        FROM extracted_facts ef
-        JOIN funds f ON f.fund_id = ef.fund_id
-        JOIN source_documents sd ON sd.document_id = ef.source_document_id
-        {where}
-        ORDER BY ef.reviewed_at DESC, ef.created_at DESC
-        """,
-        params,
-    )
-    st.caption(f"Rejected facts found: {len(rejected)}")
-    if not rejected:
-        st.info("No rejected facts match the current filter.")
-        return
-
-    selected_fact_id = st.selectbox(
-        "Rejected fact",
-        options=[fact["fact_id"] for fact in rejected],
-        format_func=lambda fact_id: next(
-            (
-                f"{fact['fund_name']} · {fact['fact_category']}.{fact['fact_name']} · "
-                f"{fact['document_title']} · page {fact['page_number'] or 'unknown'}"
-            )
-            for fact in rejected
-            if fact["fact_id"] == fact_id
-        ),
-        key="fact_admin_rejected_fact",
-    )
-    fact = next(fact for fact in rejected if fact["fact_id"] == selected_fact_id)
-
-    cols = st.columns([1, 1])
-    with cols[0]:
-        reviewer = st.text_input("Reviewer", value="christian", key=f"reopen_reviewer_{fact['fact_id']}")
-        raw_value = st.text_area(
-            "Revised raw value",
-            value=fact["raw_value"],
-            height=120,
-            key=f"reopen_raw_{fact['fact_id']}",
-        )
-        normalized_value = st.text_input(
-            "Revised normalized value",
-            value=fact["normalized_value"] or fact["raw_value"],
-            key=f"reopen_norm_{fact['fact_id']}",
-        )
-        note = st.text_input(
-            "Reopen note",
-            value=f"Reopened rejected fact {fact['fact_id']} for review.",
-            key=f"reopen_note_{fact['fact_id']}",
-        )
-        if st.button("Reopen as pending", key=f"reopen_{fact['fact_id']}"):
-            with connect_db() as connection:
-                reopen_rejected_fact(
-                    connection,
-                    fact["fact_id"],
-                    raw_value,
-                    normalized_value,
-                    reviewer,
-                    note,
-                )
-                connection.commit()
-            st.success("Fact reopened. It will appear in the Approval Queue.")
-            st.rerun()
-    with cols[1]:
-        st.markdown("**Last rejection**")
-        st.write(
-            {
-                "reviewed_by": fact["reviewed_by"],
-                "reviewed_at": fact["reviewed_at"],
-                "review_note": fact["review_note"],
-            }
-        )
-        render_evidence_panel(fact)
-
-
 def render_analysis_runs():
     st.subheader("AI Analyst")
-    st.caption("Uses approved FundSnapshot data only. Raw pending LLM extractions are not included.")
+    st.caption(
+        "Uses approved FundSnapshot data only. Raw pending LLM extractions are not included."
+    )
     all_funds = fund_options()
     fund_ids = st.multiselect(
         "Funds to include",
         options=[fund["fund_id"] for fund in all_funds],
         default=[all_funds[0]["fund_id"]] if all_funds else [],
-        format_func=lambda fid: next(fund["fund_name"] for fund in all_funds if fund["fund_id"] == fid),
+        format_func=lambda fid: next(
+            fund["fund_name"] for fund in all_funds if fund["fund_id"] == fid
+        ),
     )
     left, right = st.columns([2, 1])
     with left:
@@ -982,7 +1095,9 @@ def render_analysis_runs():
             placeholder="Example: Identify the main diligence gaps, unusual characteristics, and data limitations for these funds.",
         )
     with right:
-        model_name = st.text_input("Model", value=DEFAULT_ANALYSIS_MODEL, key="analysis_model_name")
+        model_name = st.text_input(
+            "Model", value=DEFAULT_ANALYSIS_MODEL, key="analysis_model_name"
+        )
         reasoning_effort = st.selectbox(
             "Reasoning effort",
             ["low", "medium", "high"],
@@ -991,7 +1106,9 @@ def render_analysis_runs():
             else 1,
             key="analysis_reasoning_effort",
         )
-        created_by = st.text_input("Created by", value="christian", key="analysis_created_by")
+        created_by = st.text_input(
+            "Created by", value="christian", key="analysis_created_by"
+        )
 
     action_col1, action_col2 = st.columns([1, 1])
     if action_col1.button("Run analysis", disabled=not fund_ids or not question):
@@ -1034,7 +1151,9 @@ def render_comparison():
         "Funds to compare",
         options=[fund["fund_id"] for fund in all_funds],
         default=[fund["fund_id"] for fund in all_funds[:2]],
-        format_func=lambda fid: next(fund["fund_name"] for fund in all_funds if fund["fund_id"] == fid),
+        format_func=lambda fid: next(
+            fund["fund_name"] for fund in all_funds if fund["fund_id"] == fid
+        ),
         key="comparison_selected_funds",
     )
     if not selected:
@@ -1055,7 +1174,9 @@ def render_comparison():
     with c2:
         st.markdown("**Analysis Readiness Scores**")
         st.dataframe(
-            with_fund_names(pd.DataFrame(comparison["analysis_readiness_scores"]), name_by_id),
+            with_fund_names(
+                pd.DataFrame(comparison["analysis_readiness_scores"]), name_by_id
+            ),
             use_container_width=True,
             hide_index=True,
         )
@@ -1072,19 +1193,35 @@ def render_comparison():
     if aligned_returns.empty:
         st.info("No overlapping approved return periods found for the selected funds.")
     else:
-        st.dataframe(with_fund_names(aligned_returns, name_by_id), use_container_width=True, hide_index=True)
+        st.dataframe(
+            with_fund_names(aligned_returns, name_by_id),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     if st.button("Generate comparison workbook", key="comparison_generate_workbook"):
         from core.config import EXPORT_DIR
 
         output_path = EXPORT_DIR / "fund_comparison.xlsx"
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-            with_fund_names(pd.DataFrame(comparison["profiles"]), name_by_id).to_excel(writer, sheet_name="profiles", index=False)
-            with_fund_names(pd.DataFrame(comparison["return_statistics"]), name_by_id).to_excel(writer, sheet_name="return_stats", index=False)
-            with_fund_names(pd.DataFrame(comparison.get("aligned_returns", [])), name_by_id).to_excel(writer, sheet_name="aligned_returns", index=False)
-            with_fund_names(pd.DataFrame(comparison["analysis_readiness_scores"]), name_by_id).to_excel(writer, sheet_name="readiness_scores", index=False)
-            with_fund_names(pd.DataFrame(comparison["similarity_matrix"]), name_by_id).to_excel(writer, sheet_name="similarity", index=False)
-            pd.DataFrame([{"paragraph": comparison["comparison_paragraph"]}]).to_excel(writer, sheet_name="summary", index=False)
+            with_fund_names(pd.DataFrame(comparison["profiles"]), name_by_id).to_excel(
+                writer, sheet_name="profiles", index=False
+            )
+            with_fund_names(
+                pd.DataFrame(comparison["return_statistics"]), name_by_id
+            ).to_excel(writer, sheet_name="return_stats", index=False)
+            with_fund_names(
+                pd.DataFrame(comparison.get("aligned_returns", [])), name_by_id
+            ).to_excel(writer, sheet_name="aligned_returns", index=False)
+            with_fund_names(
+                pd.DataFrame(comparison["analysis_readiness_scores"]), name_by_id
+            ).to_excel(writer, sheet_name="readiness_scores", index=False)
+            with_fund_names(
+                pd.DataFrame(comparison["similarity_matrix"]), name_by_id
+            ).to_excel(writer, sheet_name="similarity", index=False)
+            pd.DataFrame([{"paragraph": comparison["comparison_paragraph"]}]).to_excel(
+                writer, sheet_name="summary", index=False
+            )
         st.success(f"Workbook created: {output_path}")
         st.download_button(
             "Download comparison workbook",
@@ -1095,11 +1232,15 @@ def render_comparison():
 
     st.divider()
     st.subheader("Web Research Overlay")
-    st.caption("Optional. Uses web search as public context and saves the result as analysis, not source-of-truth.")
+    st.caption(
+        "Optional. Uses web search as public context and saves the result as analysis, not source-of-truth."
+    )
     web_fund = st.selectbox(
         "Fund for public web comparison",
         options=selected,
-        format_func=lambda fid: next(fund["fund_name"] for fund in all_funds if fund["fund_id"] == fid),
+        format_func=lambda fid: next(
+            fund["fund_name"] for fund in all_funds if fund["fund_id"] == fid
+        ),
         key="comparison_web_fund",
     )
     web_question = st.text_area(
@@ -1124,19 +1265,19 @@ def render_comparison():
 
 
 def render_review_center():
-    review_tabs = st.tabs(["Approval Queue", "Promotion", "Conflicts"])
-    with review_tabs[0]:
-        render_approval_queue()
-    with review_tabs[1]:
-        render_promotion()
-    with review_tabs[2]:
-        render_conflicts()
+    st.subheader("Review")
+    st.caption(
+        "Terminal-first review is the primary workflow now. Use `python scripts/review_document_bundle.py --document-id <doc_id> --pending-only --show-ids` for approve/revise/reject actions."
+    )
+    render_conflicts()
 
 
 def render_data_exports():
     st.subheader("Data & Exports")
     col1, col2 = st.columns(2)
-    if col1.button("Create source-of-truth workbook", key="exports_create_source_truth_workbook"):
+    if col1.button(
+        "Create source-of-truth workbook", key="exports_create_source_truth_workbook"
+    ):
         with connect_db() as connection:
             output_path = export_source_truth_workbook(connection)
         st.success(f"Workbook created: {output_path}")
@@ -1164,7 +1305,6 @@ def render_data_exports():
             "fund_characteristics",
             "fund_writeups",
             "fund_flags",
-            "proposed_return_rows",
             "performance_returns",
             "fund_metrics",
             "analysis_runs",
@@ -1175,23 +1315,18 @@ def render_data_exports():
 
 
 def render_admin():
-    admin_tabs = st.tabs(["Clean Tables", "Raw Documents", "System Tree", "Fact Admin"])
+    admin_tabs = st.tabs(["Clean Tables", "Raw Documents", "System Tree"])
     with admin_tabs[0]:
         render_clean_tables()
     with admin_tabs[1]:
         render_documents()
     with admin_tabs[2]:
         render_overview()
-    with admin_tabs[3]:
-        render_fact_admin()
 
 
 def main():
-    migrated_rows = ensure_return_row_backfill(data_version())
     st.title("Japan Activist Funds Research Platform")
     st.caption(f"Database: {DB_PATH}")
-    if migrated_rows:
-        st.caption(f"Return staging foundation refreshed: {migrated_rows} legacy return row(s) synced into proposed return storage.")
 
     tabs = st.tabs(
         [

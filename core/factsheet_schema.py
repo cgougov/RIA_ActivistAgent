@@ -56,5 +56,6 @@ STANDARDIZED_FIELD_SPECS = {
     "notes_flags": [
         ("neutral_summary", "Neutral summary", {("writeup", "neutral_summary")}),
         ("differentiating_edge", "Differentiating edge", {("writeup", "differentiating_edge")}),
+        ("data_limitations", "Data limitations", {("writeup", "data_limitations")}),
     ],
 }

@@ -21,6 +21,26 @@ def _clean_text(value):
     return text or None
 
 
+def _normalized_text(value):
+    cleaned = _clean_text(value)
+    return cleaned.lower() if cleaned else None
+
+
+def _coalesced_value(value):
+    if value is None:
+        return None
+    return str(value)
+
+
+def _matching_text(value):
+    return _normalized_text(value) or ""
+
+
+def _find_existing(connection, query, params):
+    row = connection.execute(query, params).fetchone()
+    return dict(row) if row else None
+
+
 def _return_quality_score(return_type):
     normalized = (_clean_text(return_type) or "unknown").lower()
     if normalized == "net":
@@ -123,8 +143,55 @@ def promote_fund_characteristic(connection, fact):
     if definition is None:
         return None
 
-    record_id = f"char_{uuid4().hex}"
     value = value_for(fact)
+    value_number = parse_number(value)
+    existing = _find_existing(
+        connection,
+        """
+        SELECT characteristic_id, value_text
+        FROM fund_characteristics
+        WHERE fund_id = ?
+          AND group_id = ?
+          AND fact_category = ?
+          AND fact_name = ?
+          AND COALESCE(as_of_date, '') = COALESCE(?, '')
+        ORDER BY created_at DESC, characteristic_id DESC
+        LIMIT 1
+        """,
+        (
+            fact["fund_id"],
+            definition["group_id"],
+            fact["fact_category"],
+            fact["fact_name"],
+            fact["as_of_date"],
+        ),
+    )
+    if existing:
+        if _matching_text(existing.get("value_text")) == _matching_text(value):
+            return "fund_characteristics", existing["characteristic_id"]
+        connection.execute(
+            """
+            UPDATE fund_characteristics
+            SET display_name = ?, value_text = ?, value_number = ?, unit = ?, source_document_id = ?,
+                page_number = ?, quoted_text = ?, approved_fact_id = ?, updated_at = ?
+            WHERE characteristic_id = ?
+            """,
+            (
+                definition["display_name"],
+                value,
+                value_number,
+                fact["unit"],
+                fact["source_document_id"],
+                fact["page_number"],
+                fact["quoted_text"],
+                fact["approved_fact_id"],
+                utc_now(),
+                existing["characteristic_id"],
+            ),
+        )
+        return "fund_characteristics", existing["characteristic_id"]
+
+    record_id = f"char_{uuid4().hex}"
     connection.execute(
         """
         INSERT INTO fund_characteristics (
@@ -143,7 +210,7 @@ def promote_fund_characteristic(connection, fact):
             fact["fact_name"],
             definition["display_name"],
             value,
-            parse_number(value),
+            value_number,
             fact["unit"],
             fact["as_of_date"],
             fact["source_document_id"],
@@ -219,8 +286,38 @@ def promote_person(connection, fact):
     if fact["fact_category"] != "people":
         return None
 
-    record_id = f"person_{uuid4().hex}"
     role_title = fact["fact_name"].replace("_", " ")
+    existing = _find_existing(
+        connection,
+        """
+        SELECT person_id
+        FROM fund_people
+        WHERE fund_id = ?
+          AND lower(trim(person_name)) = lower(trim(?))
+          AND lower(trim(COALESCE(role_title, ''))) = lower(trim(?))
+        ORDER BY created_at DESC, person_id DESC
+        LIMIT 1
+        """,
+        (fact["fund_id"], value_for(fact), role_title),
+    )
+    if existing:
+        connection.execute(
+            """
+            UPDATE fund_people
+            SET source_document_id = ?, page_number = ?, approved_fact_id = ?, updated_at = ?
+            WHERE person_id = ?
+            """,
+            (
+                fact["source_document_id"],
+                fact["page_number"],
+                fact["approved_fact_id"],
+                utc_now(),
+                existing["person_id"],
+            ),
+        )
+        return "fund_people", existing["person_id"]
+
+    record_id = f"person_{uuid4().hex}"
     connection.execute(
         """
         INSERT INTO fund_people (
@@ -251,6 +348,49 @@ def promote_terms(connection, fact):
 
     raw_value = value_for(fact)
     stored_value = parse_number(raw_value) if column in {"management_fee", "performance_fee"} else raw_value
+    share_class = raw_value if column == "share_class" else None
+    existing_rows = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT *
+            FROM fund_terms
+            WHERE fund_id = ?
+              AND COALESCE(share_class, '') = COALESCE(?, '')
+            ORDER BY effective_date DESC, created_at DESC, terms_id DESC
+            """,
+            (fact["fund_id"], share_class),
+        ).fetchall()
+    ]
+    if column == "share_class":
+        for row in existing_rows:
+            if _matching_text(row.get("share_class")) == _matching_text(stored_value):
+                return "fund_terms", row["terms_id"]
+    else:
+        for row in existing_rows:
+            if _matching_text(_coalesced_value(row.get(column))) == _matching_text(_coalesced_value(stored_value)):
+                return "fund_terms", row["terms_id"]
+        for row in existing_rows:
+            if row.get(column) in (None, ""):
+                connection.execute(
+                    f"""
+                    UPDATE fund_terms
+                    SET {column} = ?, effective_date = ?, source_document_id = ?, page_number = ?,
+                        approved_fact_id = ?, updated_at = ?
+                    WHERE terms_id = ?
+                    """,
+                    (
+                        stored_value,
+                        fact["as_of_date"],
+                        fact["source_document_id"],
+                        fact["page_number"],
+                        fact["approved_fact_id"],
+                        utc_now(),
+                        row["terms_id"],
+                    ),
+                )
+                return "fund_terms", row["terms_id"]
+
     record_id = f"terms_{uuid4().hex}"
     connection.execute(
         f"""
@@ -280,6 +420,41 @@ def promote_strategy(connection, fact):
     if not column:
         return None
 
+    stored_value = value_for(fact)
+    existing_rows = [
+        dict(row)
+        for row in connection.execute(
+            """
+            SELECT *
+            FROM fund_strategy
+            WHERE fund_id = ?
+            ORDER BY created_at DESC, strategy_id DESC
+            """,
+            (fact["fund_id"],),
+        ).fetchall()
+    ]
+    for row in existing_rows:
+        if _matching_text(row.get(column)) == _matching_text(stored_value):
+            return "fund_strategy", row["strategy_id"]
+    for row in existing_rows:
+        if row.get(column) in (None, ""):
+            connection.execute(
+                f"""
+                UPDATE fund_strategy
+                SET {column} = ?, source_document_id = ?, page_number = ?, approved_fact_id = ?, updated_at = ?
+                WHERE strategy_id = ?
+                """,
+                (
+                    stored_value,
+                    fact["source_document_id"],
+                    fact["page_number"],
+                    fact["approved_fact_id"],
+                    utc_now(),
+                    row["strategy_id"],
+                ),
+            )
+            return "fund_strategy", row["strategy_id"]
+
     record_id = f"strategy_{uuid4().hex}"
     connection.execute(
         f"""
@@ -292,7 +467,7 @@ def promote_strategy(connection, fact):
         (
             record_id,
             fact["fund_id"],
-            value_for(fact),
+            stored_value,
             fact["source_document_id"],
             fact["page_number"],
             fact["approved_fact_id"],
@@ -418,6 +593,44 @@ def promote_metric(connection, fact):
     if is_return_fact(fact):
         return None
 
+    metric_value = parse_number(value_for(fact))
+    existing = _find_existing(
+        connection,
+        """
+        SELECT metric_id, normalized_value
+        FROM fund_metrics
+        WHERE fund_id = ?
+          AND metric_name = ?
+          AND COALESCE(as_of_date, '') = COALESCE(?, '')
+        ORDER BY created_at DESC, metric_id DESC
+        LIMIT 1
+        """,
+        (fact["fund_id"], fact["fact_name"], fact["as_of_date"]),
+    )
+    if existing:
+        if _matching_text(existing.get("normalized_value")) == _matching_text(value_for(fact)):
+            return "fund_metrics", existing["metric_id"]
+        connection.execute(
+            """
+            UPDATE fund_metrics
+            SET metric_value = ?, raw_value = ?, normalized_value = ?, unit = ?, source_document_id = ?,
+                page_number = ?, approved_fact_id = ?, updated_at = ?
+            WHERE metric_id = ?
+            """,
+            (
+                metric_value,
+                fact["approved_value"],
+                value_for(fact),
+                fact["unit"],
+                fact["source_document_id"],
+                fact["page_number"],
+                fact["approved_fact_id"],
+                utc_now(),
+                existing["metric_id"],
+            ),
+        )
+        return "fund_metrics", existing["metric_id"]
+
     record_id = f"metric_{uuid4().hex}"
     connection.execute(
         """
@@ -432,7 +645,7 @@ def promote_metric(connection, fact):
             record_id,
             fact["fund_id"],
             fact["fact_name"],
-            parse_number(value_for(fact)),
+            metric_value,
             fact["approved_value"],
             value_for(fact),
             fact["unit"],
@@ -451,6 +664,44 @@ def promote_exposure(connection, fact):
     if fact["fact_category"] != "exposure":
         return None
 
+    exposure_value = parse_number(value_for(fact))
+    existing = _find_existing(
+        connection,
+        """
+        SELECT exposure_id, normalized_value
+        FROM fund_exposures
+        WHERE fund_id = ?
+          AND exposure_name = ?
+          AND COALESCE(as_of_date, '') = COALESCE(?, '')
+        ORDER BY created_at DESC, exposure_id DESC
+        LIMIT 1
+        """,
+        (fact["fund_id"], fact["fact_name"], fact["as_of_date"]),
+    )
+    if existing:
+        if _matching_text(existing.get("normalized_value")) == _matching_text(value_for(fact)):
+            return "fund_exposures", existing["exposure_id"]
+        connection.execute(
+            """
+            UPDATE fund_exposures
+            SET exposure_value = ?, raw_value = ?, normalized_value = ?, unit = ?, source_document_id = ?,
+                page_number = ?, approved_fact_id = ?, updated_at = ?
+            WHERE exposure_id = ?
+            """,
+            (
+                exposure_value,
+                fact["approved_value"],
+                value_for(fact),
+                fact["unit"],
+                fact["source_document_id"],
+                fact["page_number"],
+                fact["approved_fact_id"],
+                utc_now(),
+                existing["exposure_id"],
+            ),
+        )
+        return "fund_exposures", existing["exposure_id"]
+
     record_id = f"exposure_{uuid4().hex}"
     connection.execute(
         """
@@ -465,7 +716,7 @@ def promote_exposure(connection, fact):
             record_id,
             fact["fund_id"],
             fact["fact_name"],
-            parse_number(value_for(fact)),
+            exposure_value,
             fact["approved_value"],
             value_for(fact),
             fact["unit"],
@@ -483,6 +734,38 @@ def promote_exposure(connection, fact):
 def promote_writeup(connection, fact):
     if fact["fact_category"] != "writeup":
         return None
+
+    existing = _find_existing(
+        connection,
+        """
+        SELECT writeup_id, writeup_text
+        FROM fund_writeups
+        WHERE fund_id = ?
+          AND writeup_type = ?
+        ORDER BY created_at DESC, writeup_id DESC
+        LIMIT 1
+        """,
+        (fact["fund_id"], fact["fact_name"]),
+    )
+    if existing:
+        if _matching_text(existing.get("writeup_text")) == _matching_text(value_for(fact)):
+            return "fund_writeups", existing["writeup_id"]
+        connection.execute(
+            """
+            UPDATE fund_writeups
+            SET writeup_text = ?, source_document_id = ?, page_number = ?, approved_fact_id = ?, updated_at = ?
+            WHERE writeup_id = ?
+            """,
+            (
+                value_for(fact),
+                fact["source_document_id"],
+                fact["page_number"],
+                fact["approved_fact_id"],
+                utc_now(),
+                existing["writeup_id"],
+            ),
+        )
+        return "fund_writeups", existing["writeup_id"]
 
     record_id = f"writeup_{uuid4().hex}"
     connection.execute(
@@ -515,6 +798,22 @@ def promote_flag(connection, fact):
     payload = {}
     if fact.get("structured_payload_json"):
         payload = json.loads(fact["structured_payload_json"])
+
+    existing = _find_existing(
+        connection,
+        """
+        SELECT flag_id
+        FROM fund_flags
+        WHERE fund_id = ?
+          AND flag_type = ?
+          AND lower(trim(flag_text)) = lower(trim(?))
+        ORDER BY created_at DESC, flag_id DESC
+        LIMIT 1
+        """,
+        (fact["fund_id"], fact["fact_name"], value_for(fact)),
+    )
+    if existing:
+        return "fund_flags", existing["flag_id"]
 
     record_id = f"flag_{uuid4().hex}"
     connection.execute(
@@ -556,7 +855,6 @@ def promote_fact(connection, fact, user):
         lambda conn, row, _user: promote_person(conn, row),
         lambda conn, row, _user: promote_terms(conn, row),
         lambda conn, row, _user: promote_strategy(conn, row),
-        lambda conn, row, _user: promote_return(conn, row),
         lambda conn, row, _user: promote_metric(conn, row),
         lambda conn, row, _user: promote_exposure(conn, row),
         lambda conn, row, _user: promote_writeup(conn, row),

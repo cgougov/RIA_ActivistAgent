@@ -19,7 +19,7 @@ from core.document_review import (
     revise_and_approve_fact,
     revise_and_approve_return_row,
 )
-from core.extraction import sanitize_proposed_facts
+from core.extraction import sanitize_proposed_facts, save_extraction_run
 from core.fund_views import build_fund_view
 from core.fund_snapshot import FundSnapshot
 from core.mock_data import insert_approved_fact, load_mock_approved_data
@@ -123,7 +123,23 @@ def _seed_terminal_review_fixture(connection, document_id="doc_terminal_test"):
             VALUES (?, 'run_terminal_test', 'fund_002', ?, ?, ?, ?, ?, NULL, '2026-07-07', ?, 1, ?, 'test', ?, 'pending')
             """,
             (fact_id, document_id, category, fact_name, raw_value, normalized_value, document_id, quote, confidence),
+            )
+
+    connection.execute(
+        """
+        INSERT INTO extracted_facts (
+            fact_id, run_id, fund_id, document_id, fact_category, fact_name, raw_value,
+            normalized_value, unit, as_of_date, source_document_id, page_number,
+            quoted_text, extraction_method, confidence_score, approval_status
         )
+        VALUES (
+            'fact_terminal_cio_dup', 'run_terminal_test', 'fund_002', ?, 'people', 'chief_investment_officer',
+            'Hiromasa Mizushima', 'Hiromasa Mizushima', NULL, '2026-07-07', ?, 2,
+            'Chief Investment Officer: Hiromasa Mizushima', 'test', 0.92, 'pending'
+        )
+        """,
+        (document_id, document_id),
+    )
 
     upsert_proposed_return_row(
         connection,
@@ -304,8 +320,63 @@ def test_document_bundle(connection):
     assert note_fact_names.count("differentiating_edge") <= 1
     manager_fact_names = [row["fact_name"] for row in pending_bundle["sections"]["manager"]]
     assert "role_title" not in manager_fact_names
+    manager_entry = pending_bundle["standardized_sections"]["manager"][0]
+    assert manager_entry["display_value"] == "Hiromasa Mizushima - Chief investment officer"
+    assert ";" not in manager_entry["display_value"]
+    assert manager_entry["candidate_count"] == 1
     scratch.close()
     print("document bundle: OK")
+
+
+def test_cross_document_duplicate_gate(connection):
+    scratch = sqlite3.connect(":memory:")
+    scratch.row_factory = sqlite3.Row
+    scratch.execute("PRAGMA foreign_keys = ON;")
+    connection.backup(scratch)
+
+    _ensure_terminal_test_document(scratch, "doc_duplicate_a")
+    _ensure_terminal_test_document(scratch, "doc_duplicate_b")
+    doc_a = dict(
+        scratch.execute(
+            "SELECT * FROM source_documents WHERE document_id = 'doc_duplicate_a'"
+        ).fetchone()
+    )
+    doc_b = dict(
+        scratch.execute(
+            "SELECT * FROM source_documents WHERE document_id = 'doc_duplicate_b'"
+        ).fetchone()
+    )
+    facts = [
+        {
+            "fact_category": "performance",
+            "fact_name": "beta",
+            "raw_value": "0.49",
+            "normalized_value": "0.49",
+            "unit": None,
+            "as_of_date": "2026-07-07",
+            "page_number": 1,
+            "quoted_text": "Beta 0.49",
+            "structured_payload_json": None,
+            "confidence_score": 0.95,
+        }
+    ]
+
+    first_run_id = save_extraction_run(scratch, doc_a, facts, "test-model", "{}", "performance")
+    first_row = scratch.execute(
+        "SELECT approval_status FROM extracted_facts WHERE run_id = ?",
+        (first_run_id,),
+    ).fetchone()
+    assert first_row["approval_status"] == "pending"
+
+    second_run_id = save_extraction_run(scratch, doc_b, facts, "test-model", "{}", "performance")
+    second_row = scratch.execute(
+        "SELECT approval_status, review_note FROM extracted_facts WHERE run_id = ?",
+        (second_run_id,),
+    ).fetchone()
+    assert second_row["approval_status"] == "rejected"
+    assert "Auto-rejected exact duplicate" in second_row["review_note"]
+    scratch.close()
+    print("cross-document duplicate gate: OK")
 
 
 def test_extraction_sanitization():
@@ -1256,6 +1327,7 @@ def main():
         test_fund_snapshot(connection)
         test_fund_view(connection)
         test_document_bundle(connection)
+        test_cross_document_duplicate_gate(connection)
         test_extraction_sanitization()
         test_db_backup_helper()
         test_document_section_review_actions(connection)

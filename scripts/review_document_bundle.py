@@ -12,9 +12,11 @@ from core.document_bundle import build_document_bundle
 from core.document_review import (
     REVIEWABLE_SECTIONS,
     approve_document_section,
+    reopen_document_fact,
     reject_document_fact,
     reject_document_return_row,
     reject_document_section,
+    revise_document_fact,
     revise_and_approve_fact,
     revise_and_approve_return_row,
 )
@@ -240,6 +242,8 @@ def main():
     action_group.add_argument("--approve-all-pending", action="store_true")
     action_group.add_argument("--reject-all-pending", action="store_true")
     action_group.add_argument("--approve-fact-id")
+    action_group.add_argument("--revise-fact-id")
+    action_group.add_argument("--reopen-fact-id")
     action_group.add_argument("--reject-fact-id")
     action_group.add_argument("--approve-return-row-id")
     action_group.add_argument("--reject-return-row-id")
@@ -393,6 +397,32 @@ def main():
             )
             connection.commit()
             _print_specific_action_result("APPROVED FACT", result)
+        elif args.revise_fact_id:
+            result = revise_document_fact(
+                connection,
+                args.revise_fact_id,
+                reviewer=args.reviewer,
+                raw_value=args.approved_value,
+                normalized_value=args.normalized_value,
+                note=args.note,
+            )
+            connection.commit()
+            _print_specific_action_result("REVISED FACT", result)
+        elif args.reopen_fact_id:
+            raw_value = args.approved_value or args.normalized_value
+            normalized_value = args.normalized_value or args.approved_value
+            if raw_value is None or normalized_value is None:
+                raise ValueError("--reopen-fact-id requires --approved-value and/or --normalized-value.")
+            result = reopen_document_fact(
+                connection,
+                args.reopen_fact_id,
+                reviewer=args.reviewer,
+                raw_value=raw_value,
+                normalized_value=normalized_value,
+                note=args.note,
+            )
+            connection.commit()
+            _print_specific_action_result("REOPENED FACT", result)
         elif args.reject_fact_id:
             result = reject_document_fact(
                 connection,

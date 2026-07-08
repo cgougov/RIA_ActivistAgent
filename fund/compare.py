@@ -31,7 +31,79 @@ def compare_funds(connection, fund_ids, field_keys=None):
     common_stats = common_period_statistics(overlap, fund_ids)
     return {"fund_ids": list(fund_ids), "sheets": sheets, "rows": rows,
             "overlapping_returns": overlap, "common_period_statistics": common_stats,
+            "calendar_year": calendar_year_comparison(sheets, fund_ids),
             "own_history_statistics": {fid: sheets[fid]["return_statistics"] for fid in fund_ids}}
+
+
+def _annual_stats(values):
+    """Summary over a fund's annual (calendar-year) returns, in percent points."""
+    if not values:
+        return {"count": 0}
+    stats = {"count": len(values), "average": round(statistics.mean(values), 1),
+             "best": round(max(values), 1), "worst": round(min(values), 1),
+             "cumulative": round((_compound(values) - 1) * 100, 1)}
+    stats["volatility"] = round(statistics.stdev(values), 1) if len(values) > 1 else None
+    return stats
+
+
+def _group_by_class(rows):
+    classes = {}
+    for row in rows:
+        classes.setdefault(row["share_class"], []).append(row)
+    return classes
+
+
+def _annual_from_monthly(monthly_rows):
+    """Calendar-year returns compounded from monthly returns — complete years only
+    (12 observations). Deterministic; used when a fund reports no annual figure."""
+    by_year = {}
+    for row in monthly_rows:
+        by_year.setdefault(row["period_end"][:4], []).append(row["return_pct"])
+    return {year: round((_compound(vals) - 1) * 100, 1)
+            for year, vals in by_year.items() if len(vals) == 12}
+
+
+def annual_series(sheets):
+    """One representative annual series per fund. Prefer the fund's reported annual
+    returns (longest share-class series); otherwise compound complete calendar years
+    from monthly returns. Returns (by_fund {year: pct}, class_used, source)."""
+    by_fund, class_used, source = {}, {}, {}
+    for fund_id, sheet in sheets.items():
+        annual = _group_by_class([r for r in sheet["returns"] if r["period_type"] == "annual"])
+        if annual:
+            best = max(annual, key=lambda c: len(annual[c]))
+            by_fund[fund_id] = {row["period_end"][:4]: row["return_pct"] for row in annual[best]}
+            class_used[fund_id], source[fund_id] = best or "(unspecified class)", "reported"
+            continue
+        monthly = _group_by_class([r for r in sheet["returns"] if r["period_type"] == "monthly"])
+        if monthly:
+            best = max(monthly, key=lambda c: len(monthly[c]))
+            computed = _annual_from_monthly(monthly[best])
+            by_fund[fund_id] = computed
+            class_used[fund_id] = (best or "(unspecified class)") if computed else None
+            source[fund_id] = "computed from monthly" if computed else None
+        else:
+            by_fund[fund_id], class_used[fund_id], source[fund_id] = {}, None, None
+    return by_fund, class_used, source
+
+
+def calendar_year_comparison(sheets, fund_ids):
+    """Compare funds on calendar-year (annual) returns — the cleanest apples-to-
+    apples view. Rows span the union of years; stats cover each fund's own history
+    plus the years every fund shares."""
+    by_fund, class_used, source = annual_series(sheets)
+    years = sorted({year for series in by_fund.values() for year in series})
+    rows = [{"year": year, **{fid: by_fund[fid].get(year) for fid in fund_ids}}
+            for year in years]
+    own_stats = {fid: _annual_stats([by_fund[fid][y] for y in sorted(by_fund[fid])])
+                 for fid in fund_ids}
+    common_years = [y for y in years
+                    if all(by_fund[fid].get(y) is not None for fid in fund_ids)]
+    common_stats = {fid: _annual_stats([by_fund[fid][y] for y in common_years])
+                    for fid in fund_ids} if common_years else {}
+    return {"years": years, "rows": rows, "class_used": class_used, "source": source,
+            "own_stats": own_stats, "common_years": common_years,
+            "common_stats": common_stats}
 
 
 def common_period_statistics(overlap, fund_ids):
@@ -96,8 +168,39 @@ def format_comparison(comparison):
         )
         lines.append(f"  {row['label']:<24}{cells}")
 
-    common = comparison["common_period_statistics"]
     header = f"  {'':<24}" + "".join(names[f][: width - 2].ljust(width) for f in fund_ids)
+
+    # Calendar-year (annual) returns — the headline apples-to-apples comparison.
+    cy = comparison["calendar_year"]
+    if cy["years"]:
+        classes = "; ".join(
+            f"{names[f]}: {cy['class_used'][f]} ({cy['source'][f]})"
+            for f in fund_ids if cy["class_used"][f])
+        lines.append(f"\nReturns — CALENDAR YEAR (annual %, net where available)")
+        if classes:
+            lines.append(f"  series used -> {classes}")
+        lines.append(header)
+        for row in cy["rows"]:
+            cells = "".join(
+                (f"{row[f]:+.1f}%" if row[f] is not None else "—").ljust(width) for f in fund_ids)
+            lines.append(f"  {row['year']:<24}{cells}")
+        for stat, label in (("average", "avg annual %"), ("best", "best year %"),
+                            ("worst", "worst year %"), ("volatility", "volatility %"),
+                            ("cumulative", "cumulative % (own)"), ("count", "years of history")):
+            cells = "".join(
+                str(cy["own_stats"][f].get(stat, "—")).ljust(width) for f in fund_ids)
+            lines.append(f"  {label:<24}{cells}")
+        if cy["common_years"]:
+            span = f"{cy['common_years'][0]}–{cy['common_years'][-1]}"
+            lines.append(f"\n  Common years only ({len(cy['common_years'])}: {span}, apples-to-apples):")
+            for stat, label in (("average", "avg annual %"), ("cumulative", "cumulative %")):
+                cells = "".join(
+                    str(cy["common_stats"][f].get(stat, "—")).ljust(width) for f in fund_ids)
+                lines.append(f"  {label:<24}{cells}")
+        else:
+            lines.append("\n  No calendar year is shared by all funds — see own-history stats above.")
+
+    common = comparison["common_period_statistics"]
     if common["count"] >= 2:
         lines.append(
             f"\nReturns — COMMON PERIOD ONLY: {common['count']} monthly observations, "

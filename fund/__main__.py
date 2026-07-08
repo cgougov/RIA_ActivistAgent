@@ -121,8 +121,10 @@ def cmd_extract(args):
         if args.returns:
             if not args.page:
                 sys.exit("--returns requires --page N")
-            result = extract_mod.extract_returns(conn, args.doc_id, args.page,
-                                                 force=args.force, dry_run=args.dry_run)
+            extractor = (extract_mod.extract_returns_from_text if args.from_text
+                         else extract_mod.extract_returns)
+            result = extractor(conn, args.doc_id, args.page,
+                               force=args.force, dry_run=args.dry_run)
         else:
             scopes = list(extract_mod.SCOPE_GUIDANCE) if args.all_scopes else [args.scope]
             if scopes == [None]:
@@ -354,6 +356,9 @@ def main():
     p.add_argument("--scope", choices=list(extract_mod.SCOPE_GUIDANCE))
     p.add_argument("--all-scopes", action="store_true")
     p.add_argument("--returns", action="store_true")
+    p.add_argument("--from-text", dest="from_text", action="store_true",
+                   help="extract returns from page text instead of the page image "
+                        "(for tables the vision model won't read)")
     p.add_argument("--page", type=int)
     p.add_argument("--force", action="store_true")
     p.add_argument("--dry-run", action="store_true")

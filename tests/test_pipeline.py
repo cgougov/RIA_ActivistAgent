@@ -152,6 +152,64 @@ def test_common_period_comparison():
     print("common-period comparison: OK")
 
 
+def stage_annual(conn, doc, fund, year, value, share_class="", return_type="net"):
+    from uuid import uuid4
+    rid = f"ret_{uuid4().hex[:8]}"
+    conn.execute(
+        """INSERT INTO proposed_returns (row_id, doc_id, fund_id, period_type, period_end,
+           return_pct, return_type, share_class, created_at)
+           VALUES (?, ?, ?, 'annual', ?, ?, ?, ?, ?)""",
+        (rid, doc, fund, f"{year}-12-31", value, return_type, share_class, utc_now()))
+    return rid
+
+
+def test_calendar_year_comparison():
+    from fund.compare import calendar_year_comparison
+    from fund.factsheet import build_factsheet
+    conn = make_db()
+    # f1: 2022,2023,2024 ; f2: 2023,2024,2025 -> common years 2023,2024
+    for year, value in [(2022, 10.0), (2023, 20.0), (2024, -5.0)]:
+        approve_return_row(conn, stage_annual(conn, "d1", "f1", year, value), "t")
+    for year, value in [(2023, 5.0), (2024, 15.0), (2025, 8.0)]:
+        approve_return_row(conn, stage_annual(conn, "d3", "f2", year, value), "t")
+    sheets = {fid: build_factsheet(conn, fid) for fid in ("f1", "f2")}
+    cy = calendar_year_comparison(sheets, ["f1", "f2"])
+    assert cy["years"] == ["2022", "2023", "2024", "2025"]
+    assert cy["common_years"] == ["2023", "2024"]
+    assert cy["own_stats"]["f1"]["count"] == 3
+    assert cy["common_stats"]["f1"]["average"] == 7.5   # mean(20,-5)
+    assert cy["common_stats"]["f2"]["average"] == 10.0  # mean(5,15)
+    # picks the longest annual series when a fund has two share classes
+    approve_return_row(conn, stage_annual(conn, "d1", "f1", 2021, 3.0, share_class="B"), "t")
+    approve_return_row(conn, stage_annual(conn, "d1", "f1", 2020, 3.0, share_class="B"), "t")
+    approve_return_row(conn, stage_annual(conn, "d1", "f1", 2019, 3.0, share_class="B"), "t")
+    approve_return_row(conn, stage_annual(conn, "d1", "f1", 2018, 3.0, share_class="B"), "t")
+    sheets = {fid: build_factsheet(conn, fid) for fid in ("f1", "f2")}
+    cy = calendar_year_comparison(sheets, ["f1", "f2"])
+    assert cy["class_used"]["f1"] == "B"  # 4 rows > 3 rows in the default class
+    assert cy["source"]["f1"] == "reported" and cy["source"]["f2"] == "reported"
+    print("calendar-year comparison: OK")
+
+
+def test_annual_computed_from_monthly():
+    from fund.compare import calendar_year_comparison
+    from fund.factsheet import build_factsheet
+    conn = make_db()
+    # f1 reports an annual figure; f2 has only 12 monthly rows for 2024 -> computed
+    approve_return_row(conn, stage_annual(conn, "d1", "f1", 2024, 10.0), "t")
+    for month in range(1, 13):
+        end = f"2024-{month:02d}-28"
+        approve_return_row(conn, stage_return(conn, doc="d3", fund="f2", period_end=end, value=1.0), "t")
+    sheets = {fid: build_factsheet(conn, fid) for fid in ("f1", "f2")}
+    cy = calendar_year_comparison(sheets, ["f1", "f2"])
+    assert cy["source"]["f1"] == "reported"
+    assert cy["source"]["f2"] == "computed from monthly"
+    # twelve +1.0% months compound to ~12.7%
+    f2_2024 = next(r["f2"] for r in cy["rows"] if r["year"] == "2024")
+    assert f2_2024 == 12.7
+    print("annual computed from monthly: OK")
+
+
 def test_most_recent_source_wins():
     from fund.review import doc_dates, resolve_field_conflicts
     conn = make_db()
@@ -192,6 +250,8 @@ if __name__ == "__main__":
     test_return_quality_upsert()
     test_factsheet_and_compare()
     test_common_period_comparison()
+    test_calendar_year_comparison()
+    test_annual_computed_from_monthly()
     test_most_recent_source_wins()
     test_proposed_factsheet_assembly()
     print("All pipeline tests passed.")

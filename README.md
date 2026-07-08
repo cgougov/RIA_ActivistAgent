@@ -43,6 +43,7 @@ fund list                      # every fund, its typeable handle, and review sta
 fund extract doc_003 --scope profile_terms --dry-run   # preflight, no API
 fund extract doc_003 --all-scopes                      # LLM: propose descriptive facts
 fund extract doc_003 --returns --page 1                # LLM vision: propose return rows
+fund extract doc_005 --returns --page 1 --from-text    # returns from page text (vision-hostile tables)
 
 fund review simplex --list     # the whole proposed factsheet at once, with evidence
 fund review simplex            # [a]pprove all / [r]eject some then approve / [f]ield-by-field
@@ -52,7 +53,7 @@ fund review doc_003            # or scope the review to a single document
 fund factsheet simplex --sources           # the standardized factsheet (returns at the bottom)
 fund factsheet simplex --save              # freeze a hashed snapshot
 fund returns simplex                       # approved return history
-fund compare simplex begonia               # side-by-side; returns over the common period only
+fund compare simplex begonia               # side-by-side; calendar-year + common-period returns
 fund compare simplex begonia --fields management_fee,sharpe_ratio
 
 fund analyze --funds simplex,begonia -q "..."   # LLM analysis, cited, approved data only

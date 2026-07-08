@@ -259,7 +259,15 @@ def extract_returns(connection, doc_id, page_number, force=False, dry_run=False)
         doc_id=doc_id, fund_id=document["fund_id"],
     )
     rows = parse_json(call_id, output).get("rows", [])
+    inserted, skipped = _save_return_rows(connection, document, page_number, rows)
+    return {"doc_id": doc_id, "page": page_number, "call_id": call_id,
+            "proposed": len(rows), "inserted": inserted, "skipped": skipped}
 
+
+def _save_return_rows(connection, document, page_number, rows):
+    """Validate, dedup and stage proposed return rows. Shared by the vision and
+    text return extractors. Returns (inserted_count, skipped_list)."""
+    fund_id = document["fund_id"]
     inserted, skipped = 0, []
     for index, row in enumerate(rows):
         period_type = str(row.get("period_type", "")).lower().strip()
@@ -283,8 +291,8 @@ def extract_returns(connection, doc_id, page_number, force=False, dry_run=False)
                SELECT 1 FROM returns
                WHERE fund_id = ? AND share_class = ? AND period_type = ? AND period_end = ?
                  AND return_pct = ?""",
-            (document["fund_id"], share_class, period_type, period_end,
-             document["fund_id"], share_class, period_type, period_end, value),
+            (fund_id, share_class, period_type, period_end,
+             fund_id, share_class, period_type, period_end, value),
         ).fetchone()
         if duplicate:
             skipped.append((index, f"{period_type} {period_end} already staged or approved"))
@@ -297,7 +305,7 @@ def extract_returns(connection, doc_id, page_number, force=False, dry_run=False)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                f"ret_{uuid4().hex[:12]}", doc_id, document["fund_id"], period_type,
+                f"ret_{uuid4().hex[:12]}", document["doc_id"], fund_id, period_type,
                 row.get("period_start_date"), period_end, value,
                 (row.get("return_type") or "unknown").lower(), share_class,
                 page_number, row.get("quoted_text"), row.get("confidence"), utc_now(),
@@ -305,5 +313,53 @@ def extract_returns(connection, doc_id, page_number, force=False, dry_run=False)
         )
         inserted += 1
     connection.commit()
-    return {"doc_id": doc_id, "page": page_number, "call_id": call_id,
+    return inserted, skipped
+
+
+RETURNS_TEXT_NOTE = """
+The performance table did NOT read reliably as an image, so you are given the raw
+page TEXT below instead. Reconstruct the periodic return rows from it.
+- The table is usually a year-by-month grid: a year label, then that year's monthly
+  returns in order (Jan..Dec), then the year's total/YTD, and sometimes a trailing
+  benchmark figure.
+- EXCLUDE benchmark/index columns and rows (e.g. TOPIX, MSCI, Nikkei, S&P) — extract
+  ONLY the fund's own returns.
+- Emit one monthly row per month shown and one annual row per completed year
+  (period_end = that year's Dec 31). For the current, partial year, emit its YTD as a
+  ytd row with period_end set to the latest month-end stated on the page.
+"""
+
+
+def extract_returns_from_text(connection, doc_id, page_number, force=False, dry_run=False):
+    """Text-based return extraction, for tables that are vision-hostile but whose
+    numbers are present in the extracted page text. Same proposal/dedup path."""
+    document = _load_document(connection, doc_id)
+    page = connection.execute(
+        "SELECT text FROM pages WHERE doc_id = ? AND page_number = ?", (doc_id, page_number)
+    ).fetchone()
+    if page is None or not (page["text"] or "").strip():
+        raise ValueError(f"{doc_id} page {page_number} has no extractable text.")
+    prior = connection.execute(
+        """SELECT COUNT(*) FROM proposed_returns
+           WHERE doc_id = ? AND page = ? AND status != 'rejected'""",
+        (doc_id, page_number),
+    ).fetchone()[0]
+    if prior and not force:
+        raise ValueError(
+            f"{prior} proposed return rows already exist for {doc_id} page {page_number}. Use --force.")
+    if dry_run:
+        return {"doc_id": doc_id, "page": page_number, "mode": "text", "dry_run": True}
+    prompt = (
+        f"Extract the performance return table from this fund page.\n"
+        f"Document: {document['title']} ({document['doc_type']}, "
+        f"date: {document['doc_date'] or 'unknown'}), page {page_number}.\n\n"
+        f"{RETURNS_PROMPT_RULES}\n\n{RETURNS_TEXT_NOTE}\n\nPAGE TEXT:\n{page['text'][:9000]}"
+    )
+    call_id, output = call(
+        connection, call_type="extract:returns_text", model=EXTRACT_MODEL,
+        prompt_input=prompt, doc_id=doc_id, fund_id=document["fund_id"],
+    )
+    rows = parse_json(call_id, output).get("rows", [])
+    inserted, skipped = _save_return_rows(connection, document, page_number, rows)
+    return {"doc_id": doc_id, "page": page_number, "mode": "text", "call_id": call_id,
             "proposed": len(rows), "inserted": inserted, "skipped": skipped}

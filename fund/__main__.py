@@ -80,16 +80,6 @@ def cmd_status(args):
                       f"{row['pending']:>8}  {row['fund_name']}")
 
 
-def _short_name(fund_name):
-    """The typeable handle for a fund: first meaningful word of its name."""
-    skip = {"the", "japan", "capital"}
-    for word in fund_name.replace(",", " ").split():
-        cleaned = word.strip().lower()
-        if cleaned and cleaned not in skip and cleaned.isalpha():
-            return cleaned
-    return fund_name.split()[0].lower()
-
-
 def cmd_list(args):
     with connect() as conn:
         rows = conn.execute(
@@ -104,7 +94,7 @@ def cmd_list(args):
     for row in rows:
         state = "approved" if row["facts"] else "unreviewed"
         pending = row["pending"] + row["pending_ret"]
-        print(f"  {_short_name(row['fund_name']):<12} {row['fund_id']:<10} {row['facts']:>5} "
+        print(f"  {compare_mod.short_name(row['fund_name']):<12} {row['fund_id']:<10} {row['facts']:>5} "
               f"{row['returns']:>7} {pending:>8}  {row['fund_name']}  [{state}]")
 
 

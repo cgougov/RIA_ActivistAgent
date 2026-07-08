@@ -151,12 +151,26 @@ def overlapping_returns(sheets, period_type="monthly"):
     ]
 
 
+def short_name(fund_name):
+    """The typeable handle for a fund: first meaningful word of its name."""
+    skip = {"the", "japan", "capital"}
+    for word in fund_name.replace(",", " ").split():
+        cleaned = word.strip().lower()
+        if cleaned and cleaned not in skip and cleaned.isalpha():
+            return cleaned
+    return fund_name.split()[0].lower()
+
+
 def format_comparison(comparison):
     fund_ids = comparison["fund_ids"]
-    names = {fid: comparison["sheets"][fid]["fund_name"] for fid in fund_ids}
-    width = max(28, *(len(names[f]) + 2 for f in fund_ids))
+    full = {fid: comparison["sheets"][fid]["fund_name"] for fid in fund_ids}
+    names = {fid: short_name(full[fid]) for fid in fund_ids}
+    width = max(22, *(len(names[f]) + 2 for f in fund_ids))
 
-    lines = ["", " " * 26 + "".join(names[f][: width - 2].ljust(width) for f in fund_ids), "=" * (26 + width * len(fund_ids))]
+    legend = "\n".join(f"  {names[f]:<12} {full[f]}" for f in fund_ids)
+    lines = ["", "Funds:", legend, "",
+             " " * 26 + "".join(names[f].ljust(width) for f in fund_ids),
+             "=" * (26 + width * len(fund_ids))]
     current_section = None
     for row in comparison["rows"]:
         if row["section"] != current_section:

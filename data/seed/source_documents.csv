@@ -11,5 +11,5 @@ doc_009,fund_005,Edwall_FS.pdf,factsheet,"Edwall Japan Strategies, LP",needs_rev
 doc_010,fund_005,Edwall_PRS.pdf,presentation,Edwall Management / Edwall Japan Strategies LP,needs_review,quarter,"Page 1: Q2 2022; Edwall Management; Edwall Japan Strategies LP.",needs_review
 doc_011,fund_006,Begonia_FSpdf.pdf,factsheet,Begonia Capital Update,2026-05-31,day,"Page 1: 31 May 2026; Begonia Capital had a net return.",pending_approval
 doc_012,fund_006,Begonia_Presentaton.pdf,presentation,Begonia Capital Presentation,needs_review,month,"Pages 3 and 16: Begonia Capital; fund terms; expected launch May 2024.",needs_review
-doc_013,fund_007,Ichigo_FS.pdf,factsheet,Ichigo Portfolio Update,2026-04-30,day,"Page 1: As of Valuation Date: 30 April 2026; Ichigo.",pending_approval
-doc_014,fund_007,Ichigo_PRS.pdf,presentation,Ichigo Asset Management Presentation,needs_review,month,"Page 1: Ichigo Asset Management; June 2015.",needs_review
+doc_013,fund_007,Ichigo_FS.pdf,presentation,Ichigo Asset Management Presentation,2015-06,month,"CONTENT MISLABELED ON DISK: Ichigo_FS.pdf is actually the 40-page June 2015 presentation. Page 1: Ichigo Asset Management; June 2015; For Investor Internal Use.",needs_review
+doc_014,fund_007,Ichigo_PRS.pdf,factsheet,Ichigo Portfolio Update,2026-04-30,day,"CONTENT MISLABELED ON DISK: Ichigo_PRS.pdf is actually the 1-page April 2026 fund update. Page 1: As of Valuation Date: 30 April 2026; Ichigo up 0.4% in April.",pending_approval

@@ -135,10 +135,40 @@ def test_factsheet_and_compare():
     print("factsheet + compare: OK")
 
 
+def test_common_period_comparison():
+    conn = make_db()
+    # f1 has Jan+Feb+Mar; f2 has Feb+Mar+Apr -> common period is Feb+Mar only
+    for period, value in [("2025-01-31", 1.0), ("2025-02-28", 2.0), ("2025-03-31", 3.0)]:
+        approve_return_row(conn, stage_return(conn, period_end=period, value=value), "t")
+    for period, value in [("2025-02-28", 0.0), ("2025-03-31", 4.0), ("2025-04-30", 5.0)]:
+        approve_return_row(conn, stage_return(conn, doc="d3", fund="f2", period_end=period, value=value), "t")
+    comparison = compare_funds(conn, ["f1", "f2"])
+    common = comparison["common_period_statistics"]
+    assert common["count"] == 2
+    assert common["period_start"] == "2025-02-28" and common["period_end"] == "2025-03-31"
+    # f1 over the common period: mean(2,3)=2.5 ; f2: mean(0,4)=2.0
+    assert common["by_fund"]["f1"]["average"] == 2.5
+    assert common["by_fund"]["f2"]["average"] == 2.0
+    print("common-period comparison: OK")
+
+
+def test_proposed_factsheet_assembly():
+    from fund.factsheet import build_proposed_factsheet
+    conn = make_db()
+    stage(conn, key="management_fee", value="1.5")
+    stage(conn, key="notice_period", value="90 days")
+    proposed = build_proposed_factsheet(conn, "f1")
+    assert proposed["count"] == 2
+    assert len(proposed["sections"]["terms"]) == 2
+    print("proposed factsheet assembly: OK")
+
+
 if __name__ == "__main__":
     test_staging_and_dedup()
     test_approval_is_structurally_deduped()
     test_reject_and_reopen()
     test_return_quality_upsert()
     test_factsheet_and_compare()
+    test_common_period_comparison()
+    test_proposed_factsheet_assembly()
     print("All pipeline tests passed.")

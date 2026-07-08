@@ -125,32 +125,93 @@ def format_factsheet(sheet, show_sources=False):
                 lines.append(f"  {'':<24} [{source['doc_id']} p.{source['page']}]")
         lines.append("")
 
+    lines.append(SECTION_TITLES["returns"])
+    lines.append("-" * len(SECTION_TITLES["returns"]))
     stats = sheet["return_statistics"]
     if stats.get("count", 0) >= 2:
-        lines.append(SECTION_TITLES["returns"])
-        lines.append("-" * len(SECTION_TITLES["returns"]))
         lines.append(
             f"  {stats['count']} {stats['period_type']} observations | "
             f"avg {stats['average']}%  vol {stats['volatility']}%  "
             f"sharpe-like {stats['sharpe_like']}  best {stats['best']}%  worst {stats['worst']}%"
         )
         lines.append("")
+    if sheet["returns"]:
+        lines.append(format_returns_table(sheet["returns"], indent="  "))
+    else:
+        lines.append("  No approved return rows yet.")
+    lines.append("")
     return "\n".join(lines)
 
 
-def format_returns_table(returns):
+def format_returns_table(returns, indent=""):
     """Chronological return rows grouped by share class, for the terminal."""
     if not returns:
-        return "No approved return rows."
+        return f"{indent}No approved return rows."
     lines = []
     classes = sorted({row["share_class"] for row in returns})
     for share_class in classes:
         rows = [r for r in returns if r["share_class"] == share_class]
         label = share_class or "(unspecified class)"
-        lines.append(f"{label}:")
+        lines.append(f"{indent}{label}:")
         for row in sorted(rows, key=lambda r: (r["period_type"], r["period_end"])):
             lines.append(
-                f"  {row['period_type']:<10} {row['period_end']}  "
+                f"{indent}  {row['period_type']:<10} {row['period_end']}  "
                 f"{row['return_pct']:>7.2f}%  ({row['return_type']})"
             )
+    return "\n".join(lines)
+
+
+def build_proposed_factsheet(connection, fund_id):
+    """Assemble the PENDING proposals for a fund into the same section shape as an
+    approved factsheet, so a reviewer can inspect the whole document at once."""
+    fund = connection.execute("SELECT * FROM funds WHERE fund_id = ?", (fund_id,)).fetchone()
+    if fund is None:
+        raise ValueError(f"Unknown fund_id: {fund_id}")
+    proposals = [dict(row) for row in connection.execute(
+        "SELECT * FROM proposals WHERE fund_id = ? AND status = 'pending' ORDER BY field_key",
+        (fund_id,),
+    )]
+    by_section = {section: [] for section in SECTION_ORDER}
+    for prop in proposals:
+        section = FIELDS[prop["field_key"]][0]
+        by_section[section].append(prop)
+    returns = [dict(row) for row in connection.execute(
+        """SELECT * FROM proposed_returns WHERE fund_id = ? AND status = 'pending'
+           ORDER BY share_class, period_type, period_end""",
+        (fund_id,),
+    )]
+    return {"fund_id": fund_id, "fund_name": fund["fund_name"],
+            "sections": by_section, "returns": returns,
+            "count": len(proposals), "return_count": len(returns)}
+
+
+def format_proposed_factsheet(proposed):
+    """Render the pending proposals as a reviewable factsheet with short ids."""
+    lines = [
+        f"PROPOSED factsheet for {proposed['fund_name']} ({proposed['fund_id']})",
+        f"{proposed['count']} pending fields, {proposed['return_count']} pending return rows",
+        "",
+    ]
+    for section in SECTION_ORDER:
+        props = proposed["sections"][section]
+        if not props:
+            continue
+        lines.append(SECTION_TITLES[section])
+        lines.append("-" * len(SECTION_TITLES[section]))
+        for prop in props:
+            value = prop["value"]
+            if len(value) > 90:
+                value = value[:90] + "…"
+            lines.append(f"  [{prop['proposal_id']}] {FIELDS[prop['field_key']][1]}: {value}")
+            lines.append(f"      from {prop['doc_id']} p.{prop['page']}")
+        lines.append("")
+    if proposed["returns"]:
+        lines.append(SECTION_TITLES["returns"])
+        lines.append("-" * len(SECTION_TITLES["returns"]))
+        classes = sorted({row["share_class"] for row in proposed["returns"]})
+        for share_class in classes:
+            rows = [r for r in proposed["returns"] if r["share_class"] == share_class]
+            lines.append(f"  {share_class or '(unspecified class)'}: "
+                         f"{len(rows)} rows ({rows[0]['period_end']} … {rows[-1]['period_end']})")
+        lines.append("")
     return "\n".join(lines)

@@ -2,14 +2,17 @@
 
   fund init                      create the database
   fund status                    pipeline state at a glance
+  fund list                      every fund, its typeable name, and review state
   fund ingest                    absorb PDFs (funds/docs from data/seed)
   fund extract DOC [...]         LLM: propose facts / return rows
-  fund review DOC [...]          approve / reject / revise proposals
-  fund factsheet FUND            the standardized factsheet
-  fund returns FUND              approved return history
-  fund compare FUND FUND [...]   deterministic side-by-side
+  fund review NAME               review a fund's whole proposed factsheet at once
+  fund factsheet NAME            the standardized factsheet (returns at the bottom)
+  fund returns NAME              approved return history
+  fund compare NAME NAME [...]   deterministic side-by-side, common period only
   fund analyze --funds a,b -q Q  LLM analysis on approved truth
   fund analyses / show / log     saved analyses and the LLM call log
+
+Funds can be named by a handle (simplex, begonia) instead of fund_002.
 """
 import argparse
 import json
@@ -23,6 +26,25 @@ from fund import ingest as ingest_mod
 from fund import review as review_mod
 from fund.config import DB_PATH
 from fund.db import connect, create_schema
+
+
+def resolve_fund(conn, token):
+    """Turn a user token into a fund_id. Accepts the exact id ('fund_002') or a
+    case-insensitive substring of the fund or manager name ('simplex')."""
+    exact = conn.execute("SELECT fund_id FROM funds WHERE fund_id = ?", (token,)).fetchone()
+    if exact:
+        return exact["fund_id"]
+    like = f"%{token}%"
+    matches = conn.execute(
+        "SELECT fund_id, fund_name FROM funds WHERE fund_name LIKE ? OR manager_name LIKE ? "
+        "ORDER BY fund_id", (like, like),
+    ).fetchall()
+    if not matches:
+        raise ValueError(f"No fund matches '{token}'. Try: fund list")
+    if len(matches) > 1:
+        names = ", ".join(f"{m['fund_id']} ({m['fund_name']})" for m in matches)
+        raise ValueError(f"'{token}' is ambiguous: {names}")
+    return matches[0]["fund_id"]
 
 
 def cmd_init(args):
@@ -56,6 +78,34 @@ def cmd_status(args):
             for row in rows:
                 print(f"  {row['fund_id']:<10} {row['facts']:>6} {row['returns']:>8} "
                       f"{row['pending']:>8}  {row['fund_name']}")
+
+
+def _short_name(fund_name):
+    """The typeable handle for a fund: first meaningful word of its name."""
+    skip = {"the", "japan", "capital"}
+    for word in fund_name.replace(",", " ").split():
+        cleaned = word.strip().lower()
+        if cleaned and cleaned not in skip and cleaned.isalpha():
+            return cleaned
+    return fund_name.split()[0].lower()
+
+
+def cmd_list(args):
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT f.fund_id, f.fund_name, f.manager_name,
+                      (SELECT COUNT(*) FROM facts WHERE fund_id = f.fund_id) AS facts,
+                      (SELECT COUNT(*) FROM returns WHERE fund_id = f.fund_id) AS returns,
+                      (SELECT COUNT(*) FROM proposals WHERE fund_id = f.fund_id AND status='pending') AS pending,
+                      (SELECT COUNT(*) FROM proposed_returns WHERE fund_id = f.fund_id AND status='pending') AS pending_ret
+               FROM funds f ORDER BY f.fund_id"""
+        ).fetchall()
+    print(f"  {'type this':<12} {'fund_id':<10} {'facts':>5} {'returns':>7} {'pending':>8}  name")
+    for row in rows:
+        state = "approved" if row["facts"] else "unreviewed"
+        pending = row["pending"] + row["pending_ret"]
+        print(f"  {_short_name(row['fund_name']):<12} {row['fund_id']:<10} {row['facts']:>5} "
+              f"{row['returns']:>7} {pending:>8}  {row['fund_name']}  [{state}]")
 
 
 def cmd_ingest(args):
@@ -126,65 +176,81 @@ def cmd_review(args):
             print("rejected return row")
             return
 
-        proposals = review_mod.pending_proposals(conn, doc_id=args.doc_id)
-        returns = review_mod.pending_returns(conn, doc_id=args.doc_id)
+        # Resolve the target: a document id, or a fund name/id (whole factsheet).
+        doc_id, fund_id = None, None
+        if args.target:
+            if conn.execute("SELECT 1 FROM documents WHERE doc_id = ?", (args.target,)).fetchone():
+                doc_id = args.target
+            else:
+                fund_id = resolve_fund(conn, args.target)
+
+        proposals = review_mod.pending_proposals(conn, doc_id=doc_id, fund_id=fund_id)
+        returns = review_mod.pending_returns(conn, doc_id=doc_id, fund_id=fund_id)
         if not proposals and not returns:
             print("Nothing pending.")
             return
 
-        if args.list:
+        # Show the whole proposed factsheet at once (grouped by section, incl. returns).
+        if fund_id:
+            print(factsheet_mod.format_proposed_factsheet(
+                factsheet_mod.build_proposed_factsheet(conn, fund_id)))
+        else:
             for row in proposals:
                 _print_proposal(row)
             if returns:
                 print(f"\nPending return rows ({len(returns)}):")
                 for row in returns:
-                    print(f"  {row['row_id']}  {row['period_type']:<10} {row['period_end']}  "
+                    print(f"  [{row['row_id']}] {row['period_type']:<10} {row['period_end']}  "
                           f"{row['return_pct']:>7.2f}%  {row['share_class'] or '-'}")
+
+        if args.list:
             return
 
-        if args.approve_all_returns:
+        def approve_all(reject_ids=frozenset()):
+            approved = 0
+            for row in proposals:
+                if row["proposal_id"] in reject_ids or row["field_key"] in reject_ids:
+                    review_mod.reject_proposal(conn, row["proposal_id"], args.reviewer)
+                else:
+                    review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer)
+                    approved += 1
             for row in returns:
-                outcome = review_mod.approve_return_row(conn, row["row_id"], args.reviewer)
-                print(f"  {row['period_type']} {row['period_end']}: {outcome}")
+                review_mod.approve_return_row(conn, row["row_id"], args.reviewer)
             conn.commit()
-            print(f"Approved {len(returns)} return rows.")
-            return
+            print(f"\nApproved {approved} fields and {len(returns)} return rows; "
+                  f"rejected {len(proposals) - approved}.")
 
         if args.approve_all:
-            for row in proposals:
-                key = review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer)
-                print(f"  approved {key}: {row['value'][:60]}")
-            for row in returns:
-                outcome = review_mod.approve_return_row(conn, row["row_id"], args.reviewer)
-                print(f"  approved return {row['period_type']} {row['period_end']}: {outcome}")
-            conn.commit()
-            print(f"Approved {len(proposals)} proposals and {len(returns)} return rows.")
+            approve_all()
             return
 
-        # Interactive review
-        for index, row in enumerate(proposals, start=1):
-            _print_proposal(row, index, len(proposals))
-            choice = input("  [a]pprove / [e]dit+approve / [r]eject / [s]kip / [q]uit > ").strip().lower()
-            if choice == "q":
-                break
-            if choice == "a":
-                review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer)
-                conn.commit()
-            elif choice == "e":
-                new_value = input("  new value > ").strip()
-                review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer, value=new_value)
-                conn.commit()
-            elif choice == "r":
-                note = input("  reject note (optional) > ").strip()
-                review_mod.reject_proposal(conn, row["proposal_id"], args.reviewer, note=note)
-                conn.commit()
-        if returns:
-            print(f"\nPending return rows ({len(returns)}):")
-            for row in returns:
-                print(f"  {row['period_type']:<10} {row['period_end']}  {row['return_pct']:>7.2f}%  "
-                      f"{row['share_class'] or '-'}  ({row['return_type']})")
-            choice = input("  approve [a]ll / [n]one > ").strip().lower()
-            if choice == "a":
+        choice = input(
+            "\n  [a]pprove whole factsheet / [r]eject some then approve rest / "
+            "[f]ield-by-field / [q]uit > "
+        ).strip().lower()
+        if choice == "a":
+            approve_all()
+        elif choice == "r":
+            raw = input("  ids or field names to reject (space-separated) > ").strip().split()
+            approve_all(reject_ids=frozenset(raw))
+        elif choice == "f":
+            for index, row in enumerate(proposals, start=1):
+                _print_proposal(row, index, len(proposals))
+                pick = input("  [a]pprove / [e]dit+approve / [r]eject / [s]kip / [q]uit > ").strip().lower()
+                if pick == "q":
+                    break
+                if pick == "a":
+                    review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer)
+                    conn.commit()
+                elif pick == "e":
+                    review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer,
+                                                value=input("  new value > ").strip())
+                    conn.commit()
+                elif pick == "r":
+                    review_mod.reject_proposal(conn, row["proposal_id"], args.reviewer,
+                                               note=input("  reject note (optional) > ").strip())
+                    conn.commit()
+            if returns and input(f"\n  approve {len(returns)} return rows? [a]ll / [n]one > ").strip().lower() == "a":
                 for row in returns:
                     review_mod.approve_return_row(conn, row["row_id"], args.reviewer)
                 conn.commit()
@@ -193,29 +259,32 @@ def cmd_review(args):
 
 def cmd_factsheet(args):
     with connect() as conn:
-        sheet = factsheet_mod.build_factsheet(conn, args.fund_id)
+        fund_id = resolve_fund(conn, args.fund)
+        sheet = factsheet_mod.build_factsheet(conn, fund_id)
         print(factsheet_mod.format_factsheet(sheet, show_sources=args.sources))
         if args.save:
-            path, digest = factsheet_mod.snapshot_factsheet(conn, args.fund_id)
+            path, digest = factsheet_mod.snapshot_factsheet(conn, fund_id)
             print(f"Snapshot saved: {path} (hash {digest})")
 
 
 def cmd_returns(args):
     with connect() as conn:
-        sheet = factsheet_mod.build_factsheet(conn, args.fund_id)
+        fund_id = resolve_fund(conn, args.fund)
+        sheet = factsheet_mod.build_factsheet(conn, fund_id)
     print(factsheet_mod.format_returns_table(sheet["returns"]))
 
 
 def cmd_compare(args):
     fields = args.fields.split(",") if args.fields else None
     with connect() as conn:
-        comparison = compare_mod.compare_funds(conn, args.fund_ids, field_keys=fields)
+        fund_ids = [resolve_fund(conn, token) for token in args.funds]
+        comparison = compare_mod.compare_funds(conn, fund_ids, field_keys=fields)
     print(compare_mod.format_comparison(comparison))
 
 
 def cmd_analyze(args):
-    fund_ids = args.funds.split(",")
     with connect() as conn:
+        fund_ids = [resolve_fund(conn, token) for token in args.funds.split(",")]
         result = analyze_mod.run_analysis(conn, fund_ids, args.question, dry_run=args.dry_run)
     if args.dry_run:
         print(json.dumps(result, indent=2))
@@ -263,6 +332,7 @@ def main():
 
     sub.add_parser("init").set_defaults(func=cmd_init)
     sub.add_parser("status").set_defaults(func=cmd_status)
+    sub.add_parser("list").set_defaults(func=cmd_list)
     sub.add_parser("ingest").set_defaults(func=cmd_ingest)
 
     p = sub.add_parser("extract")
@@ -275,8 +345,8 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_extract)
 
-    p = sub.add_parser("review")
-    p.add_argument("doc_id", nargs="?")
+    p = sub.add_parser("review", help="review a whole fund's proposed factsheet (or one doc)")
+    p.add_argument("target", nargs="?", help="fund name (e.g. simplex) or a doc id")
     p.add_argument("--reviewer", default="christian")
     p.add_argument("--list", action="store_true")
     p.add_argument("--approve-id")
@@ -284,30 +354,29 @@ def main():
     p.add_argument("--reopen-id")
     p.add_argument("--approve-return-id")
     p.add_argument("--reject-return-id")
-    p.add_argument("--approve-all-returns", action="store_true")
     p.add_argument("--approve-all", action="store_true",
-                   help="approve every pending item for the document (review the list first)")
+                   help="approve everything pending for the target (review the list first)")
     p.add_argument("--value")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("factsheet")
-    p.add_argument("fund_id")
+    p.add_argument("fund", help="fund name (e.g. simplex) or id")
     p.add_argument("--sources", action="store_true")
     p.add_argument("--save", action="store_true")
     p.set_defaults(func=cmd_factsheet)
 
     p = sub.add_parser("returns")
-    p.add_argument("fund_id")
+    p.add_argument("fund", help="fund name (e.g. simplex) or id")
     p.set_defaults(func=cmd_returns)
 
     p = sub.add_parser("compare")
-    p.add_argument("fund_ids", nargs="+")
+    p.add_argument("funds", nargs="+", help="fund names (e.g. simplex begonia) or ids")
     p.add_argument("--fields")
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("analyze")
-    p.add_argument("--funds", required=True, help="comma-separated fund ids")
+    p.add_argument("--funds", required=True, help="comma-separated fund names or ids")
     p.add_argument("-q", "--question", required=True)
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_analyze)

@@ -26,26 +26,32 @@ cp .env.example .env   # add OPENAI_API_KEY
 
 ## The pipeline, in order
 
+Funds can be named by a handle (`simplex`, `begonia`) instead of `fund_002` — a
+case-insensitive match on the fund or manager name. `fund list` shows the handle
+for each fund.
+
 ```bash
 fund init                      # create the database
 fund ingest                    # register funds/documents (data/seed) and absorb PDF pages
 fund status                    # pipeline state at a glance
+fund list                      # every fund, its typeable handle, and review state
 
 fund extract doc_003 --scope profile_terms --dry-run   # preflight, no API
 fund extract doc_003 --all-scopes                      # LLM: propose descriptive facts
 fund extract doc_003 --returns --page 1                # LLM vision: propose return rows
 
-fund review doc_003 --list     # see the pending queue with evidence
-fund review doc_003            # interactive approve / edit / reject
-fund review doc_003 --approve-all          # bulk approve (review the list first)
+fund review simplex --list     # the whole proposed factsheet at once, with evidence
+fund review simplex            # [a]pprove all / [r]eject some then approve / [f]ield-by-field
+fund review simplex --approve-all          # scripted bulk approve (review --list first)
+fund review doc_003            # or scope the review to a single document
 
-fund factsheet fund_002 --sources          # the standardized factsheet
-fund factsheet fund_002 --save             # freeze a hashed snapshot
-fund returns fund_002                      # approved return history
-fund compare fund_002 fund_006             # deterministic side-by-side
-fund compare fund_002 fund_006 --fields management_fee,sharpe_ratio
+fund factsheet simplex --sources           # the standardized factsheet (returns at the bottom)
+fund factsheet simplex --save              # freeze a hashed snapshot
+fund returns simplex                       # approved return history
+fund compare simplex begonia               # side-by-side; returns over the common period only
+fund compare simplex begonia --fields management_fee,sharpe_ratio
 
-fund analyze --funds fund_002,fund_006 -q "..."   # LLM analysis, cited, approved data only
+fund analyze --funds simplex,begonia -q "..."   # LLM analysis, cited, approved data only
 fund analyses                  # saved analyses
 fund show an_xxx               # one analysis in full
 fund log                       # every LLM call: tokens, status, target

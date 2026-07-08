@@ -152,6 +152,28 @@ def test_common_period_comparison():
     print("common-period comparison: OK")
 
 
+def test_most_recent_source_wins():
+    from fund.review import doc_dates, resolve_field_conflicts
+    conn = make_db()
+    conn.execute("UPDATE documents SET doc_date = '2024-06-30' WHERE doc_id = 'd1'")
+    conn.execute("UPDATE documents SET doc_date = '2025-09-30' WHERE doc_id = 'd2'")
+    stage(conn, doc="d1", key="management_fee", value="1.5")
+    stage(conn, doc="d2", key="management_fee", value="2.0")  # newer doc, different value
+    props = pending_proposals(conn, fund_id="f1")
+    winners, superseded = resolve_field_conflicts(props, doc_dates(conn, "f1"))
+    newer = next(p for p in props if p["doc_id"] == "d2")
+    older = next(p for p in props if p["doc_id"] == "d1")
+    assert newer["proposal_id"] in winners
+    assert superseded[older["proposal_id"]]["doc_id"] == "d2"
+    # approving the winner writes the most-recent value into facts
+    approve_proposal(conn, newer["proposal_id"], "tester")
+    value = conn.execute(
+        "SELECT value FROM facts WHERE fund_id='f1' AND field_key='management_fee'"
+    ).fetchone()["value"]
+    assert value == "2.0"
+    print("most recent source wins: OK")
+
+
 def test_proposed_factsheet_assembly():
     from fund.factsheet import build_proposed_factsheet
     conn = make_db()
@@ -170,5 +192,6 @@ if __name__ == "__main__":
     test_return_quality_upsert()
     test_factsheet_and_compare()
     test_common_period_comparison()
+    test_most_recent_source_wins()
     test_proposed_factsheet_assembly()
     print("All pipeline tests passed.")

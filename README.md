@@ -12,6 +12,10 @@ absorb PDFs → extract proposed facts (LLM) → human approval → standardized
 - Do not invent data. LLM output is proposal-only; a human approves every fact.
 - Every approved fact keeps its source document, page, and quote.
 - One value per field per fund, enforced by the database itself. Approving again = revising.
+- When documents disagree on a field, the most recent source document wins; approving the
+  whole factsheet keeps that value and supersedes the older ones (shown before you approve).
+- Return extraction is high-recall by design — it captures the full multi-year history and
+  includes uncertain cells (flagged), because a human approves every row.
 - The LLM is called at exactly two points — extraction and analysis — and every call is logged.
 - If it can be computed from stored data, it is never sent to the model.
 - The factsheet is assembled on demand from approved data; analyses freeze a hashed snapshot.

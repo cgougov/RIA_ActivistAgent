@@ -206,19 +206,33 @@ def cmd_review(args):
         if args.list:
             return
 
+        # Most recent source document wins when a field has conflicting proposals.
+        conflict_fund = fund_id or (proposals[0]["fund_id"] if proposals else None)
+        dates = review_mod.doc_dates(conn, conflict_fund) if conflict_fund else {}
+        _, superseded = review_mod.resolve_field_conflicts(proposals, dates)
+
         def approve_all(reject_ids=frozenset()):
-            approved = 0
+            approved, stale = 0, 0
             for row in proposals:
+                winner = superseded.get(row["proposal_id"])
                 if row["proposal_id"] in reject_ids or row["field_key"] in reject_ids:
                     review_mod.reject_proposal(conn, row["proposal_id"], args.reviewer)
+                elif winner:
+                    review_mod.reject_proposal(
+                        conn, row["proposal_id"], args.reviewer,
+                        note=f"superseded by more recent {winner['doc_id']} "
+                             f"({dates.get(winner['doc_id']) or 'undated'})")
+                    stale += 1
                 else:
                     review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer)
                     approved += 1
             for row in returns:
                 review_mod.approve_return_row(conn, row["row_id"], args.reviewer)
             conn.commit()
+            rejected = len(proposals) - approved - stale
+            tail = f", superseded {stale} older" if stale else ""
             print(f"\nApproved {approved} fields and {len(returns)} return rows; "
-                  f"rejected {len(proposals) - approved}.")
+                  f"rejected {rejected}{tail}.")
 
         if args.approve_all:
             approve_all()

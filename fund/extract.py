@@ -195,11 +195,28 @@ Definitions:
 - return_type: net, gross, or unknown. Use net only if the source clearly says net.
 - share_class: share class/currency/class label if the table separates classes.
 
+Capture EVERYTHING — high recall is the goal:
+- Extract the COMPLETE return history in the image, not just the most recent year.
+  Performance tables often show many years of monthly rows plus a right-hand annual
+  or YTD column. Emit a row for EVERY populated cell across ALL years shown.
+- If a year shows only a single annual figure (e.g. 2008: +12.3%), still emit it as an
+  annual row with period_end_date = that year's Dec 31.
+- Capture per-year YTD/annual totals AND the monthly cells — they are different rows.
+- If the same period appears for multiple share classes, emit one row per share class.
+- Never stop early or summarize. If the table has 200 cells, return ~200 rows.
+
+Bias toward inclusion under uncertainty (a human approves every row afterwards):
+- If a cell is clearly a periodic return but you are unsure whether it is net or gross,
+  emit it with return_type "unknown" — do NOT drop it.
+- If you are unsure of the exact period-end date but the period is identifiable (a given
+  month or year), emit it with your best-guess date and a lower confidence — do NOT drop it.
+- Only omit a cell if it is plainly not a periodic return (e.g. an index level, AUM,
+  or a cumulative-since-inception line whose per-period value cannot be recovered).
+  When in doubt, INCLUDE it with low confidence and note the doubt in quoted_text.
+
 Rules:
-- Do not invent rows. Extract only return observations visible in the image.
-- Extract each monthly/quarterly/annual/YTD cell as a separate row when the date meaning is clear.
+- Do not invent numbers. Every row must correspond to a value visible in the image.
 - If a date is shown as a month or quarter, normalize period_end_date to the period's final day.
-- If the table is cumulative performance rather than periodic returns, omit it unless the period meaning is clear.
 - If no return table is visible, return {"rows": []}.
 - Return strict JSON: {"rows": [{"period_type": "...", "period_start_date": null,
   "period_end_date": "YYYY-MM-DD", "return_value": 1.23, "return_type": "net|gross|unknown",

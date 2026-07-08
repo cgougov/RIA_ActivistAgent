@@ -163,7 +163,13 @@ def format_returns_table(returns, indent=""):
 
 def build_proposed_factsheet(connection, fund_id):
     """Assemble the PENDING proposals for a fund into the same section shape as an
-    approved factsheet, so a reviewer can inspect the whole document at once."""
+    approved factsheet, so a reviewer can inspect the whole document at once.
+
+    When two documents propose different values for one field, the value from the
+    most recent source document is marked as the winner; the older ones are marked
+    superseded, so approving the whole factsheet keeps the current truth."""
+    from fund.review import doc_dates, resolve_field_conflicts
+
     fund = connection.execute("SELECT * FROM funds WHERE fund_id = ?", (fund_id,)).fetchone()
     if fund is None:
         raise ValueError(f"Unknown fund_id: {fund_id}")
@@ -171,8 +177,15 @@ def build_proposed_factsheet(connection, fund_id):
         "SELECT * FROM proposals WHERE fund_id = ? AND status = 'pending' ORDER BY field_key",
         (fund_id,),
     )]
+    dates = doc_dates(connection, fund_id)
+    _, superseded = resolve_field_conflicts(proposals, dates)
     by_section = {section: [] for section in SECTION_ORDER}
     for prop in proposals:
+        prop["doc_date"] = dates.get(prop["doc_id"])
+        winner = superseded.get(prop["proposal_id"])
+        prop["superseded_by"] = (
+            {"doc_id": winner["doc_id"], "doc_date": dates.get(winner["doc_id"]),
+             "value": winner["value"]} if winner else None)
         section = FIELDS[prop["field_key"]][0]
         by_section[section].append(prop)
     returns = [dict(row) for row in connection.execute(
@@ -202,8 +215,14 @@ def format_proposed_factsheet(proposed):
             value = prop["value"]
             if len(value) > 90:
                 value = value[:90] + "…"
-            lines.append(f"  [{prop['proposal_id']}] {FIELDS[prop['field_key']][1]}: {value}")
-            lines.append(f"      from {prop['doc_id']} p.{prop['page']}")
+            superseded = prop.get("superseded_by")
+            marker = "  (superseded)" if superseded else ""
+            lines.append(f"  [{prop['proposal_id']}] {FIELDS[prop['field_key']][1]}: {value}{marker}")
+            date = f" ({prop['doc_date']})" if prop.get("doc_date") else ""
+            lines.append(f"      from {prop['doc_id']} p.{prop['page']}{date}")
+            if superseded:
+                sup_date = f" ({superseded['doc_date']})" if superseded["doc_date"] else ""
+                lines.append(f"      -> newer {superseded['doc_id']}{sup_date} says: {superseded['value'][:70]}")
         lines.append("")
     if proposed["returns"]:
         lines.append(SECTION_TITLES["returns"])

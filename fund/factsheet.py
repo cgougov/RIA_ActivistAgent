@@ -125,39 +125,81 @@ def format_factsheet(sheet, show_sources=False):
                 lines.append(f"  {'':<24} [{source['doc_id']} p.{source['page']}]")
         lines.append("")
 
-    lines.append(SECTION_TITLES["returns"])
-    lines.append("-" * len(SECTION_TITLES["returns"]))
-    stats = sheet["return_statistics"]
-    if stats.get("count", 0) >= 2:
-        lines.append(
-            f"  {stats['count']} {stats['period_type']} observations | "
-            f"avg {stats['average']}%  vol {stats['volatility']}%  "
-            f"sharpe-like {stats['sharpe_like']}  best {stats['best']}%  worst {stats['worst']}%"
-        )
-        lines.append("")
-    if sheet["returns"]:
-        lines.append(format_returns_table(sheet["returns"], indent="  "))
-    else:
-        lines.append("  No approved return rows yet.")
-    lines.append("")
+    lines.extend(_factsheet_returns_block(sheet))
     return "\n".join(lines)
 
 
+def _by_class(rows):
+    """[(share_class, [rows])] in class order."""
+    return [(c, [r for r in rows if r["share_class"] == c])
+            for c in sorted({r["share_class"] for r in rows})]
+
+
+def _factsheet_returns_block(sheet):
+    """Returns on the factsheet: yearly first (easy to read), YTD kept separate,
+    monthly/quarterly detail left to `fund returns`."""
+    returns = sheet["returns"]
+    annual = [r for r in returns if r["period_type"] == "annual"]
+    ytd = [r for r in returns if r["period_type"] == "ytd"]
+    monthly = [r for r in returns if r["period_type"] == "monthly"]
+    quarterly = [r for r in returns if r["period_type"] == "quarterly"]
+
+    def header(title):
+        return [title, "-" * len(title)]
+
+    lines = header("Returns — annual")
+    if annual:
+        for share_class, rows in _by_class(annual):
+            lines.append(f"  {share_class or '(unspecified class)'}:")
+            for row in sorted(rows, key=lambda r: r["period_end"]):
+                lines.append(f"    {row['period_end'][:4]}   {row['return_pct']:>7.2f}%  ({row['return_type']})")
+            stats = return_statistics(returns, period_type="annual", share_class=share_class)
+            if stats.get("count", 0) >= 2:
+                lines.append(
+                    f"    {stats['count']} years | avg {stats['average']}%  "
+                    f"best {stats['best']}%  worst {stats['worst']}%  vol {stats['volatility']}%")
+    else:
+        lines.append("  No approved annual returns yet.")
+    lines.append("")
+
+    if ytd:
+        lines.extend(header("Returns — year to date"))
+        for share_class, rows in _by_class(ytd):
+            latest = max(rows, key=lambda r: r["period_end"])
+            lines.append(f"  {share_class or '(unspecified class)'}:  "
+                         f"{latest['period_end'][:4]} YTD {latest['return_pct']:>+.2f}%  "
+                         f"(as of {latest['period_end']})")
+        lines.append("")
+
+    detail = len(monthly) + len(quarterly)
+    if detail:
+        parts = [f"{len(monthly)} monthly" for _ in [0] if monthly] + \
+                [f"{len(quarterly)} quarterly" for _ in [0] if quarterly]
+        lines.append(f"  {' + '.join(parts)} rows stored — see: fund returns {sheet['fund_id']}")
+    elif not returns:
+        lines.append("  No approved return rows yet.")
+    lines.append("")
+    return lines
+
+
+_PERIOD_ORDER = {"annual": 0, "quarterly": 1, "monthly": 2, "ytd": 3}
+
+
 def format_returns_table(returns, indent=""):
-    """Chronological return rows grouped by share class, for the terminal."""
+    """Full return history grouped by share class, then by period type, for the
+    terminal. Annual, quarterly, monthly and YTD are kept as separate blocks."""
     if not returns:
         return f"{indent}No approved return rows."
     lines = []
-    classes = sorted({row["share_class"] for row in returns})
-    for share_class in classes:
-        rows = [r for r in returns if r["share_class"] == share_class]
-        label = share_class or "(unspecified class)"
-        lines.append(f"{indent}{label}:")
-        for row in sorted(rows, key=lambda r: (r["period_type"], r["period_end"])):
-            lines.append(
-                f"{indent}  {row['period_type']:<10} {row['period_end']}  "
-                f"{row['return_pct']:>7.2f}%  ({row['return_type']})"
-            )
+    for share_class, rows in _by_class(returns):
+        lines.append(f"{indent}{share_class or '(unspecified class)'}:")
+        ptypes = sorted({r["period_type"] for r in rows}, key=lambda p: _PERIOD_ORDER.get(p, 9))
+        for ptype in ptypes:
+            lines.append(f"{indent}  {ptype}:")
+            for row in sorted((r for r in rows if r["period_type"] == ptype),
+                              key=lambda r: r["period_end"]):
+                lines.append(
+                    f"{indent}    {row['period_end']}  {row['return_pct']:>7.2f}%  ({row['return_type']})")
     return "\n".join(lines)
 
 
@@ -227,10 +269,15 @@ def format_proposed_factsheet(proposed):
     if proposed["returns"]:
         lines.append(SECTION_TITLES["returns"])
         lines.append("-" * len(SECTION_TITLES["returns"]))
-        classes = sorted({row["share_class"] for row in proposed["returns"]})
-        for share_class in classes:
-            rows = [r for r in proposed["returns"] if r["share_class"] == share_class]
-            lines.append(f"  {share_class or '(unspecified class)'}: "
-                         f"{len(rows)} rows ({rows[0]['period_end']} … {rows[-1]['period_end']})")
+        for share_class, rows in _by_class(proposed["returns"]):
+            ptypes = sorted({r["period_type"] for r in rows}, key=lambda p: _PERIOD_ORDER.get(p, 9))
+            parts = []
+            for ptype in ptypes:
+                prows = sorted((r for r in rows if r["period_type"] == ptype),
+                               key=lambda r: r["period_end"])
+                span = (f"{prows[0]['period_end']}…{prows[-1]['period_end']}"
+                        if len(prows) > 1 else prows[0]["period_end"])
+                parts.append(f"{len(prows)} {ptype} ({span})")
+            lines.append(f"  {share_class or '(unspecified class)'}: {', '.join(parts)}")
         lines.append("")
     return "\n".join(lines)

@@ -123,12 +123,17 @@ def cmd_ingest(args):
 def cmd_extract(args):
     with connect() as conn:
         if args.returns:
-            if not args.page:
-                sys.exit("--returns requires --page N")
-            extractor = (extract_mod.extract_returns_from_text if args.from_text
-                         else extract_mod.extract_returns)
-            result = extractor(conn, args.doc_id, args.page,
-                               force=args.force, dry_run=args.dry_run)
+            pages = [args.page] if args.page else [
+                p for p, _ in extract_mod.find_return_pages(conn, args.doc_id)]
+            if not pages:
+                sys.exit(f"No return-table page detected in {args.doc_id}; pass --page N.")
+            if args.from_text:
+                extractor = extract_mod.extract_returns_from_text
+            else:
+                extractor = extract_mod.extract_returns_auto  # vision, auto text fallback
+            result = [extractor(conn, args.doc_id, page,
+                                force=args.force, dry_run=args.dry_run) for page in pages]
+            result = result[0] if len(result) == 1 else result
         else:
             scopes = list(extract_mod.SCOPE_GUIDANCE) if args.all_scopes else [args.scope]
             if scopes == [None]:
@@ -137,6 +142,38 @@ def cmd_extract(args):
                                                 force=args.force, dry_run=args.dry_run)
                       for scope in scopes]
     print(json.dumps(result, indent=2, default=str))
+
+
+def cmd_onboard(args):
+    with connect() as conn:
+        fund_id = resolve_fund(conn, args.fund)
+        if args.dry_run:
+            print(f"Onboarding plan for {fund_id} (no LLM calls):")
+            for item in extract_mod.onboard_plan(conn, fund_id):
+                pages = ", ".join(f"p{p}" for p in item["return_pages"]) or "none detected"
+                print(f"  {item['doc_id']} [{item['doc_type']}] {item['title']}")
+                print(f"      scopes: {', '.join(item['scopes']) or '(none)'}")
+                if item["doc_type"] == "factsheet":
+                    print(f"      return pages: {pages}")
+            return
+        results = extract_mod.onboard_fund(conn, fund_id, force=args.force)
+        handle = compare_mod.short_name(
+            conn.execute("SELECT fund_name FROM funds WHERE fund_id = ?", (fund_id,)).fetchone()[0])
+    for item in results:
+        print(f"\n{item['doc_id']} [{item['doc_type']}] {item['title']}")
+        for res in item["scope_results"]:
+            if "inserted" in res:  # scope actually ran
+                extra = f", {len(res['skipped'])} dup/skip" if res["skipped"] else ""
+                print(f"  scope {res['scope']}: {len(res['inserted'])} proposed{extra}")
+            else:                  # guarded/errored before running
+                print(f"  scope {res['scope']}: skipped ({res['skipped']})")
+        for res in item["return_results"]:
+            if "inserted" in res:  # extraction ran
+                tag = " (text fallback)" if res.get("fell_back_from_vision") else ""
+                print(f"  returns p{res['page']}: {res['inserted']} rows{tag}")
+            else:
+                print(f"  returns p{res['page']}: skipped ({res['skipped']})")
+    print(f"\nReview when ready:  fund review {handle}")
 
 
 def _print_proposal(row, index=None, total=None):
@@ -368,10 +405,16 @@ def main():
     p.add_argument("--from-text", dest="from_text", action="store_true",
                    help="extract returns from page text instead of the page image "
                         "(for tables the vision model won't read)")
-    p.add_argument("--page", type=int)
+    p.add_argument("--page", type=int, help="return page (auto-detected if omitted)")
     p.add_argument("--force", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_extract)
+
+    p = sub.add_parser("onboard", help="run a fund's whole extraction plan (doc-type routed)")
+    p.add_argument("fund", help="fund name (e.g. simplex) or id")
+    p.add_argument("--force", action="store_true", help="re-extract scopes/pages already done")
+    p.add_argument("--dry-run", action="store_true", help="show the plan, no LLM calls")
+    p.set_defaults(func=cmd_onboard)
 
     p = sub.add_parser("review", help="review a whole fund's proposed factsheet (or one doc)")
     p.add_argument("target", nargs="?", help="fund name (e.g. simplex) or a doc id")

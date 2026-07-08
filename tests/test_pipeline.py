@@ -210,6 +210,25 @@ def test_annual_computed_from_monthly():
     print("annual computed from monthly: OK")
 
 
+def test_return_page_detection_and_routing():
+    from fund.extract import find_return_pages, onboard_plan, SCOPES_BY_DOC_TYPE
+    conn = make_db()
+    conn.execute("INSERT INTO pages (doc_id, page_number, text) VALUES ('d1', 1, ?)",
+                 ("2020 2021 2022 2023 Jan Feb Mar YTD net return performance 1.2% 3.4% -0.5% 10%",))
+    conn.execute("INSERT INTO pages (doc_id, page_number, text) VALUES ('d1', 2, ?)",
+                 ("Portfolio commentary. We remain constructive on Japanese equities.",))
+    conn.execute("UPDATE documents SET doc_type = 'presentation' WHERE doc_id = 'd2'")
+    pages = find_return_pages(conn, "d1")
+    assert pages[0][0] == 1                 # the return grid wins
+    assert all(page != 2 for page, _ in pages)  # commentary page excluded
+    plan = {item["doc_id"]: item for item in onboard_plan(conn, "f1")}
+    assert plan["d1"]["scopes"] == SCOPES_BY_DOC_TYPE["factsheet"]   # FS -> quant scopes
+    assert plan["d1"]["return_pages"] == [1]
+    assert plan["d2"]["scopes"] == SCOPES_BY_DOC_TYPE["presentation"]  # PRS -> qualitative
+    assert plan["d2"]["return_pages"] == []   # returns only from fact sheets
+    print("return-page detection + routing: OK")
+
+
 def test_most_recent_source_wins():
     from fund.review import doc_dates, resolve_field_conflicts
     conn = make_db()
@@ -252,6 +271,7 @@ if __name__ == "__main__":
     test_common_period_comparison()
     test_calendar_year_comparison()
     test_annual_computed_from_monthly()
+    test_return_page_detection_and_routing()
     test_most_recent_source_wins()
     test_proposed_factsheet_assembly()
     print("All pipeline tests passed.")

@@ -40,10 +40,14 @@ fund ingest                    # register funds/documents (data/seed) and absorb
 fund status                    # pipeline state at a glance
 fund list                      # every fund, its typeable handle, and review state
 
+fund onboard simplex           # run the whole plan: doc-type-routed scopes + returns
+fund onboard simplex --dry-run # show what it would extract (pages, scopes), no API
+
 fund extract doc_003 --scope profile_terms --dry-run   # preflight, no API
 fund extract doc_003 --all-scopes                      # LLM: propose descriptive facts
-fund extract doc_003 --returns --page 1                # LLM vision: propose return rows
-fund extract doc_005 --returns --page 1 --from-text    # returns from page text (vision-hostile tables)
+fund extract doc_003 --returns                          # auto-detect return page; vision, text fallback
+fund extract doc_003 --returns --page 1                 # or name the page explicitly
+fund extract doc_005 --returns --from-text              # force text extraction (vision-hostile tables)
 
 fund review simplex --list     # the whole proposed factsheet at once, with evidence
 fund review simplex            # [a]pprove all / [r]eject some then approve / [f]ield-by-field

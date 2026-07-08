@@ -363,3 +363,109 @@ def extract_returns_from_text(connection, doc_id, page_number, force=False, dry_
     inserted, skipped = _save_return_rows(connection, document, page_number, rows)
     return {"doc_id": doc_id, "page": page_number, "mode": "text", "call_id": call_id,
             "proposed": len(rows), "inserted": inserted, "skipped": skipped}
+
+
+_MONTHS_RE = re.compile(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b")
+_YEAR_RE = re.compile(r"\b20[0-2]\d\b")
+
+
+def _return_page_score(text):
+    """How much a page looks like a performance/return table."""
+    t = text or ""
+    years = len(set(_YEAR_RE.findall(t)))
+    months = len(_MONTHS_RE.findall(t))
+    percents = t.count("%")
+    keywords = sum(t.lower().count(k) for k in ("return", "performance", "ytd", "net", "monthly"))
+    return years * 3 + months + percents + keywords
+
+
+def find_return_pages(connection, doc_id, limit=3):
+    """Rank a document's pages by return-table likelihood, best first. Always
+    includes the single best page (a fact sheet's returns are somewhere), and adds
+    further pages only when they score strongly — so genuine multi-page return
+    tables are caught but commentary/chart pages are not."""
+    pages = connection.execute(
+        "SELECT page_number, text FROM pages WHERE doc_id = ? ORDER BY page_number", (doc_id,)
+    ).fetchall()
+    scored = sorted(((p["page_number"], _return_page_score(p["text"])) for p in pages),
+                    key=lambda item: item[1], reverse=True)
+    if not scored or scored[0][1] == 0:
+        return []
+    best = scored[0]
+    strong = max(100, best[1] * 0.5)
+    return [best] + [(page, score) for page, score in scored[1:limit] if score >= strong]
+
+
+def extract_returns_auto(connection, doc_id, page_number, force=False, dry_run=False):
+    """Vision first; if it yields no rows, fall back to text extraction automatically.
+    This is the judgment that used to be manual (notice 0 rows -> retry --from-text)."""
+    result = extract_returns(connection, doc_id, page_number, force=force, dry_run=dry_run)
+    if dry_run or result.get("proposed", 0) > 0:
+        return result
+    fallback = extract_returns_from_text(connection, doc_id, page_number, force=True)
+    fallback["fell_back_from_vision"] = True
+    return fallback
+
+
+# Which extraction scopes run against each document type. Fact sheets are the
+# authoritative source for terms/metrics/returns; presentations add the qualitative
+# story (strategy, people, what makes the fund unique) but not stale numbers.
+SCOPES_BY_DOC_TYPE = {
+    "factsheet": ["profile_terms", "strategy_people", "metrics", "notes_flags"],
+    "presentation": ["strategy_people", "notes_flags"],
+}
+
+
+def _extraction_logged(connection, doc_id, call_type):
+    """True if a successful extraction of this type already ran on this document —
+    so onboarding stays idempotent even for scopes that yield no proposals."""
+    return connection.execute(
+        "SELECT 1 FROM llm_calls WHERE doc_id = ? AND call_type = ? AND status = 'ok' LIMIT 1",
+        (doc_id, call_type)).fetchone() is not None
+
+
+def onboard_plan(connection, fund_id):
+    """What onboarding will do for a fund, per document — no LLM calls."""
+    docs = connection.execute(
+        "SELECT doc_id, doc_type, title FROM documents WHERE fund_id = ? ORDER BY doc_id",
+        (fund_id,)).fetchall()
+    plan = []
+    for doc in docs:
+        return_pages = ([page for page, _ in find_return_pages(connection, doc["doc_id"])]
+                        if doc["doc_type"] == "factsheet" else [])
+        plan.append({"doc_id": doc["doc_id"], "doc_type": doc["doc_type"], "title": doc["title"],
+                     "scopes": SCOPES_BY_DOC_TYPE.get(doc["doc_type"], []),
+                     "return_pages": return_pages})
+    return plan
+
+
+def onboard_fund(connection, fund_id, force=False, dry_run=False):
+    """Run a fund's whole extraction plan: doc-type-routed scopes + auto return
+    extraction (vision->text fallback) on detected fact-sheet pages. Everything
+    lands as proposals for human review. Already-extracted scopes/pages are skipped
+    unless force=True."""
+    results = []
+    for item in onboard_plan(connection, fund_id):
+        doc_id = item["doc_id"]
+        scope_results, return_results = [], []
+        for scope in item["scopes"]:
+            if dry_run:
+                scope_results.append({"scope": scope, "dry_run": True})
+                continue
+            if not force and _extraction_logged(connection, doc_id, f"extract:{scope}"):
+                scope_results.append({"scope": scope, "skipped": "already extracted (logged)"})
+                continue
+            try:
+                scope_results.append(extract_scope(connection, doc_id, scope, force=force))
+            except (ValueError, RuntimeError) as exc:
+                scope_results.append({"scope": scope, "skipped": str(exc)})
+        for page in item["return_pages"]:
+            if dry_run:
+                return_results.append({"page": page, "dry_run": True})
+                continue
+            try:
+                return_results.append(extract_returns_auto(connection, doc_id, page, force=force))
+            except (ValueError, RuntimeError) as exc:
+                return_results.append({"page": page, "skipped": str(exc)})
+        results.append({**item, "scope_results": scope_results, "return_results": return_results})
+    return results

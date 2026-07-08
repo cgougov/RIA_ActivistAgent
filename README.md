@@ -12,8 +12,12 @@ absorb PDFs → extract proposed facts (LLM) → human approval → standardized
 - Do not invent data. LLM output is proposal-only; a human approves every fact.
 - Every approved fact keeps its source document, page, and quote.
 - One value per field per fund, enforced by the database itself. Approving again = revising.
-- When documents disagree on a field, the most recent source document wins; approving the
-  whole factsheet keeps that value and supersedes the older ones (shown before you approve).
+- Document type drives everything: fact sheets are the authoritative source for returns,
+  terms, and stats; presentations supply the qualitative story (thesis, example engagements,
+  what makes the fund unique). `fund onboard` routes extraction by type automatically.
+- When documents disagree on a field, the authoritative one wins — fact sheet over
+  presentation, then most recent — and approving the whole factsheet supersedes the rest
+  (shown before you approve). Stats say where they came from ("from fact sheet").
 - Return extraction is high-recall by design — it captures the full multi-year history and
   includes uncertain cells (flagged), because a human approves every row.
 - The LLM is called at exactly two points — extraction and analysis — and every call is logged.

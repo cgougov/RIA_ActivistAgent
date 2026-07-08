@@ -412,7 +412,7 @@ def extract_returns_auto(connection, doc_id, page_number, force=False, dry_run=F
 # story (strategy, people, what makes the fund unique) but not stale numbers.
 SCOPES_BY_DOC_TYPE = {
     "factsheet": ["profile_terms", "strategy_people", "metrics", "notes_flags"],
-    "presentation": ["strategy_people", "notes_flags"],
+    "presentation": ["strategy_people", "notes_flags", "presentation"],
 }
 
 

@@ -230,14 +230,14 @@ def test_return_page_detection_and_routing():
 
 
 def test_most_recent_source_wins():
-    from fund.review import doc_dates, resolve_field_conflicts
-    conn = make_db()
+    from fund.review import doc_meta, resolve_field_conflicts
+    conn = make_db()  # d1 and d2 are both fact sheets in make_db
     conn.execute("UPDATE documents SET doc_date = '2024-06-30' WHERE doc_id = 'd1'")
     conn.execute("UPDATE documents SET doc_date = '2025-09-30' WHERE doc_id = 'd2'")
     stage(conn, doc="d1", key="management_fee", value="1.5")
     stage(conn, doc="d2", key="management_fee", value="2.0")  # newer doc, different value
     props = pending_proposals(conn, fund_id="f1")
-    winners, superseded = resolve_field_conflicts(props, doc_dates(conn, "f1"))
+    winners, superseded = resolve_field_conflicts(props, doc_meta(conn, "f1"))
     newer = next(p for p in props if p["doc_id"] == "d2")
     older = next(p for p in props if p["doc_id"] == "d1")
     assert newer["proposal_id"] in winners
@@ -249,6 +249,23 @@ def test_most_recent_source_wins():
     ).fetchone()["value"]
     assert value == "2.0"
     print("most recent source wins: OK")
+
+
+def test_factsheet_source_beats_presentation():
+    from fund.review import doc_meta, resolve_field_conflicts
+    conn = make_db()
+    # d1 is an older FACT SHEET; d2 is a newer PRESENTATION
+    conn.execute("UPDATE documents SET doc_type='factsheet', doc_date='2020-01-01' WHERE doc_id='d1'")
+    conn.execute("UPDATE documents SET doc_type='presentation', doc_date='2026-01-01' WHERE doc_id='d2'")
+    stage(conn, doc="d1", key="management_fee", value="1.5")   # fact sheet, older
+    stage(conn, doc="d2", key="management_fee", value="9.9")   # presentation, newer
+    props = pending_proposals(conn, fund_id="f1")
+    winners, superseded = resolve_field_conflicts(props, doc_meta(conn, "f1"))
+    fs = next(p for p in props if p["doc_id"] == "d1")
+    prs = next(p for p in props if p["doc_id"] == "d2")
+    assert fs["proposal_id"] in winners            # fact sheet wins despite being older
+    assert superseded[prs["proposal_id"]]["doc_id"] == "d1"
+    print("fact sheet beats presentation: OK")
 
 
 def test_proposed_factsheet_assembly():
@@ -273,5 +290,6 @@ if __name__ == "__main__":
     test_annual_computed_from_monthly()
     test_return_page_detection_and_routing()
     test_most_recent_source_wins()
+    test_factsheet_source_beats_presentation()
     test_proposed_factsheet_assembly()
     print("All pipeline tests passed.")

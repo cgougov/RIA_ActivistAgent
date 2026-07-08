@@ -13,30 +13,35 @@ from fund.schema import FIELDS
 _RETURN_QUALITY = {"net": 2, "gross": 1, "unknown": 0}
 
 
-def doc_dates(connection, fund_id):
-    """doc_id -> doc_date for a fund. Used to let the most recent source win."""
-    return {row["doc_id"]: row["doc_date"] for row in connection.execute(
-        "SELECT doc_id, doc_date FROM documents WHERE fund_id = ?", (fund_id,))}
+def doc_meta(connection, fund_id):
+    """doc_id -> {date, type} for a fund. Drives conflict resolution (fact sheet
+    beats presentation, then recency) and source provenance on the factsheet."""
+    return {row["doc_id"]: {"date": row["doc_date"], "type": row["doc_type"]}
+            for row in connection.execute(
+                "SELECT doc_id, doc_date, doc_type FROM documents WHERE fund_id = ?", (fund_id,))}
 
 
-def _recency_key(proposal, dates):
-    """Rank a proposal for conflict resolution: newest source document first,
-    then higher confidence, then later extraction. Undated docs sort oldest."""
-    return (dates.get(proposal["doc_id"]) or "",
-            proposal.get("confidence") or 0.0,
-            proposal.get("created_at") or "")
+def _rank_key(proposal, meta):
+    """Rank a proposal for conflict resolution: a fact-sheet source outranks a
+    presentation, then the most recent source document, then higher confidence,
+    then later extraction. Undated/unknown docs sort lowest."""
+    info = meta.get(proposal["doc_id"], {})
+    is_factsheet = 1 if info.get("type") == "factsheet" else 0
+    return (is_factsheet, info.get("date") or "",
+            proposal.get("confidence") or 0.0, proposal.get("created_at") or "")
 
 
-def resolve_field_conflicts(proposals, dates):
-    """When several pending proposals target the same field, the value from the
-    most recent source document wins. Returns (winner_ids, superseded) where
-    superseded maps a losing proposal_id -> the winning proposal that beat it."""
+def resolve_field_conflicts(proposals, meta):
+    """When several pending proposals target the same field, the authoritative one
+    wins: fact sheet over presentation, then the most recent source document.
+    Returns (winner_ids, superseded) where superseded maps a losing proposal_id ->
+    the winning proposal that beat it."""
     by_field = {}
     for prop in proposals:
         by_field.setdefault(prop["field_key"], []).append(prop)
     winner_ids, superseded = set(), {}
     for group in by_field.values():
-        ranked = sorted(group, key=lambda p: _recency_key(p, dates), reverse=True)
+        ranked = sorted(group, key=lambda p: _rank_key(p, meta), reverse=True)
         winner_ids.add(ranked[0]["proposal_id"])
         for loser in ranked[1:]:
             superseded[loser["proposal_id"]] = ranked[0]

@@ -23,6 +23,8 @@ def build_factsheet(connection, fund_id):
         row["field_key"]: dict(row)
         for row in connection.execute("SELECT * FROM facts WHERE fund_id = ?", (fund_id,))
     }
+    doc_types = {row["doc_id"]: row["doc_type"] for row in connection.execute(
+        "SELECT doc_id, doc_type FROM documents WHERE fund_id = ?", (fund_id,))}
     sections = {}
     filled = 0
     for section in SECTION_ORDER:
@@ -38,7 +40,8 @@ def build_factsheet(connection, fund_id):
                 "value_num": fact["value_num"] if fact else None,
                 "unit": fact["unit"] if fact else None,
                 "as_of_date": fact["as_of_date"] if fact else None,
-                "source": {"doc_id": fact["doc_id"], "page": fact["page"], "quote": fact["quote"]}
+                "source": {"doc_id": fact["doc_id"], "page": fact["page"], "quote": fact["quote"],
+                           "doc_type": doc_types.get(fact["doc_id"])}
                           if fact else None,
             })
         sections[section] = entries
@@ -119,14 +122,23 @@ def format_factsheet(sheet, show_sources=False):
                 value = f"{value}%"
             if entry["as_of_date"]:
                 value = f"{value}  (as of {entry['as_of_date']})"
+            # Stats carry their provenance inline — the reviewer sees where each came from.
+            if section == "metrics" and entry["source"]:
+                value = f"{value}  (from {_source_kind(entry['source'])})"
             lines.append(f"  {entry['label']:<24} {value}")
             if show_sources and entry["source"]:
                 source = entry["source"]
-                lines.append(f"  {'':<24} [{source['doc_id']} p.{source['page']}]")
+                lines.append(f"  {'':<24} [{source['doc_id']} p.{source['page']} · {_source_kind(source)}]")
         lines.append("")
 
     lines.extend(_factsheet_returns_block(sheet))
     return "\n".join(lines)
+
+
+def _source_kind(source):
+    """Human label for a fact's source document type."""
+    return {"factsheet": "fact sheet", "presentation": "presentation"}.get(
+        source.get("doc_type"), source.get("doc_type") or "source")
 
 
 def _by_class(rows):
@@ -210,7 +222,7 @@ def build_proposed_factsheet(connection, fund_id):
     When two documents propose different values for one field, the value from the
     most recent source document is marked as the winner; the older ones are marked
     superseded, so approving the whole factsheet keeps the current truth."""
-    from fund.review import doc_dates, resolve_field_conflicts
+    from fund.review import doc_meta, resolve_field_conflicts
 
     fund = connection.execute("SELECT * FROM funds WHERE fund_id = ?", (fund_id,)).fetchone()
     if fund is None:
@@ -219,14 +231,14 @@ def build_proposed_factsheet(connection, fund_id):
         "SELECT * FROM proposals WHERE fund_id = ? AND status = 'pending' ORDER BY field_key",
         (fund_id,),
     )]
-    dates = doc_dates(connection, fund_id)
-    _, superseded = resolve_field_conflicts(proposals, dates)
+    meta = doc_meta(connection, fund_id)
+    _, superseded = resolve_field_conflicts(proposals, meta)
     by_section = {section: [] for section in SECTION_ORDER}
     for prop in proposals:
-        prop["doc_date"] = dates.get(prop["doc_id"])
+        prop["doc_date"] = (meta.get(prop["doc_id"]) or {}).get("date")
         winner = superseded.get(prop["proposal_id"])
         prop["superseded_by"] = (
-            {"doc_id": winner["doc_id"], "doc_date": dates.get(winner["doc_id"]),
+            {"doc_id": winner["doc_id"], "doc_date": (meta.get(winner["doc_id"]) or {}).get("date"),
              "value": winner["value"]} if winner else None)
         section = FIELDS[prop["field_key"]][0]
         by_section[section].append(prop)

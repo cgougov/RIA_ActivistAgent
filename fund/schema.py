@@ -9,7 +9,8 @@ duplicate machinery removed: no generic person_name/role_title facts, no
 strategy_primary/primary_strategy aliases.
 """
 
-SECTION_ORDER = ["overview", "people", "strategy", "terms", "metrics", "notes", "flags"]
+SECTION_ORDER = ["overview", "people", "strategy", "terms", "metrics",
+                 "notes", "presentation", "flags"]
 
 SECTION_TITLES = {
     "overview": "Overview",
@@ -18,6 +19,7 @@ SECTION_TITLES = {
     "terms": "Terms",
     "metrics": "Reported Metrics",
     "notes": "Notes",
+    "presentation": "Presentation Highlights",
     "flags": "Diligence Flags",
     "returns": "Returns",
 }
@@ -78,6 +80,13 @@ FIELDS = {
     "differentiating_edge": ("notes", "Differentiating edge", "text", None, "One short paragraph describing what appears distinctive versus peers, only if supported by the source."),
     "data_limitations": ("notes", "Data limitations", "text", None, "One short paragraph describing what the source does not disclose or what remains unclear."),
 
+    # Presentation highlights (the qualitative story, sourced from the PRS deck)
+    "investment_thesis": ("presentation", "Investment thesis", "text", None, "The manager's core investment thesis or philosophy, in their words."),
+    "value_creation_approach": ("presentation", "Value-creation approach", "text", None, "How the manager drives value — engagement, governance, operational, or capital-allocation change."),
+    "example_engagements": ("presentation", "Example engagements", "text", None, "Concrete example campaigns or case studies: named companies, actions taken, and outcomes, as 'Company: action -> outcome; ...'."),
+    "competitive_edge": ("presentation", "What makes them unique", "text", None, "What the manager presents as distinctive versus peers — access, expertise, approach, or track record."),
+    "track_record_highlights": ("presentation", "Track-record highlights", "text", None, "Notable outcomes or milestones the manager highlights, grounded in the deck."),
+
     # Diligence flags (neutral language; only for real diligence issues)
     "flag_missing_key_terms": ("flags", "Missing key terms", "text", None, "Important terms the document does not disclose."),
     "flag_unclear_fee_terms": ("flags", "Unclear fee terms", "text", None, "Fee terms that are ambiguous or inconsistent in the source."),
@@ -97,6 +106,7 @@ EXTRACTION_SCOPES = {
     "strategy_people": [k for k, v in FIELDS.items() if v[0] in ("people", "strategy")],
     "metrics": [k for k, v in FIELDS.items() if v[0] == "metrics"],
     "notes_flags": [k for k, v in FIELDS.items() if v[0] in ("notes", "flags")],
+    "presentation": [k for k, v in FIELDS.items() if v[0] == "presentation"],
 }
 
 SCOPE_GUIDANCE = {
@@ -118,6 +128,13 @@ SCOPE_GUIDANCE = {
         "Write at most one neutral_summary and at most one differentiating_edge for this document. Extract flags "
         "only for real diligence issues, source inconsistencies, or missing important disclosures that materially "
         "affect review. Do not create flags for ordinary factsheet brevity."
+    ),
+    "presentation": (
+        "This is a marketing/strategy presentation, not a fact sheet. Extract the qualitative story: the "
+        "investment thesis, how the manager creates value, concrete example engagements or case studies (named "
+        "companies, actions, outcomes), what they present as unique versus peers, and notable track-record "
+        "highlights. Do not extract fees, terms, or point-in-time metrics here — those come from the fact sheet. "
+        "Keep each field to one concise paragraph grounded in the deck."
     ),
 }
 

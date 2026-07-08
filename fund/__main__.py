@@ -249,10 +249,10 @@ def cmd_review(args):
         if args.list:
             return
 
-        # Most recent source document wins when a field has conflicting proposals.
+        # Authoritative source wins on conflict: fact sheet over presentation, then recency.
         conflict_fund = fund_id or (proposals[0]["fund_id"] if proposals else None)
-        dates = review_mod.doc_dates(conn, conflict_fund) if conflict_fund else {}
-        _, superseded = review_mod.resolve_field_conflicts(proposals, dates)
+        meta = review_mod.doc_meta(conn, conflict_fund) if conflict_fund else {}
+        _, superseded = review_mod.resolve_field_conflicts(proposals, meta)
 
         def approve_all(reject_ids=frozenset()):
             approved, stale = 0, 0
@@ -263,8 +263,8 @@ def cmd_review(args):
                 elif winner:
                     review_mod.reject_proposal(
                         conn, row["proposal_id"], args.reviewer,
-                        note=f"superseded by more recent {winner['doc_id']} "
-                             f"({dates.get(winner['doc_id']) or 'undated'})")
+                        note=f"superseded by {winner['doc_id']} "
+                             f"({(meta.get(winner['doc_id']) or {}).get('date') or 'undated'})")
                     stale += 1
                 else:
                     review_mod.approve_proposal(conn, row["proposal_id"], args.reviewer)

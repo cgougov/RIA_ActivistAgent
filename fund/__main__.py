@@ -98,6 +98,20 @@ def cmd_list(args):
               f"{row['returns']:>7} {pending:>8}  {row['fund_name']}  [{state}]")
 
 
+def cmd_prune(args):
+    with connect() as conn:
+        doc_id = args.doc
+        if doc_id and not conn.execute(
+                "SELECT 1 FROM documents WHERE doc_id = ?", (doc_id,)).fetchone():
+            sys.exit(f"error: no document {doc_id}")
+        result = ingest_mod.prune_page_images(conn, doc_id=doc_id, dry_run=args.dry_run)
+    prefix = "[dry-run] would remove" if args.dry_run else "removed"
+    scope = f" for {doc_id}" if doc_id else ""
+    print(f"{prefix} {result['images']} cached page images{scope}, "
+          f"{result['bytes'] / 1e6:.1f} MB.")
+    print("They regenerate automatically the next time a vision extraction needs them.")
+
+
 def cmd_ingest(args):
     with connect() as conn:
         create_schema(conn)
@@ -340,6 +354,11 @@ def main():
     sub.add_parser("status").set_defaults(func=cmd_status)
     sub.add_parser("list").set_defaults(func=cmd_list)
     sub.add_parser("ingest").set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("prune", help="delete cached page images (regenerated on demand)")
+    p.add_argument("--doc", help="limit to one document id")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_prune)
 
     p = sub.add_parser("extract")
     p.add_argument("doc_id")

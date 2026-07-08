@@ -60,6 +60,7 @@ fund analyze --funds simplex,begonia -q "..."   # LLM analysis, cited, approved 
 fund analyses                  # saved analyses
 fund show an_xxx               # one analysis in full
 fund log                       # every LLM call: tokens, status, target
+fund prune                     # delete cached page images (regenerated on demand)
 ```
 
 ## Layout

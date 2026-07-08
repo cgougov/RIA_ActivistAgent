@@ -107,6 +107,32 @@ def render_page_image(connection, doc_id, page_number, dpi=180):
     return output_path
 
 
+def prune_page_images(connection, doc_id=None, dry_run=False):
+    """Delete cached page images (regenerable on demand by render_page_image) and
+    clear their pages.image_path. Sweeps the filesystem so orphaned renders are
+    cleaned too. Safe retention: images are re-rendered from the source PDF
+    whenever a vision extraction next needs them."""
+    root = PAGE_IMAGE_DIR / doc_id if doc_id else PAGE_IMAGE_DIR
+    removed, freed = 0, 0
+    if root.exists():
+        for path in root.rglob("*.png"):
+            freed += path.stat().st_size
+            removed += 1
+            if not dry_run:
+                path.unlink()
+    if not dry_run:
+        where, params = "WHERE image_path IS NOT NULL", []
+        if doc_id:
+            where += " AND doc_id = ?"
+            params.append(doc_id)
+        connection.execute(f"UPDATE pages SET image_path = NULL {where}", params)
+        connection.commit()
+        for directory in sorted(PAGE_IMAGE_DIR.glob("*"), reverse=True):
+            if directory.is_dir() and not any(directory.iterdir()):
+                directory.rmdir()
+    return {"images": removed, "bytes": freed}
+
+
 def ingest_from_seeds(connection):
     """Register all funds and documents from data/seed CSVs and ingest every page."""
     results = []

@@ -376,6 +376,8 @@ The system should never make an internal calculation look like a manager-reporte
 Recommended route: push the cleaned repo to GitHub, clone it on the Microsoft
 desktop, then rebuild the environment there.
 
+Full handoff checklist: [VM_MIGRATION_PLAN.md](VM_MIGRATION_PLAN.md).
+
 Do:
 
 ```powershell

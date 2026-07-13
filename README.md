@@ -157,3 +157,6 @@ data/           pdfs, db, page_images, current factsheet snapshots
 ## Practical Guide
 
 For the actual day-to-day terminal workflow, see [TERMINAL_WORKFLOW.md](TERMINAL_WORKFLOW.md).
+
+For the Windows VM handoff and post-migration build checklist, see
+[VM_MIGRATION_PLAN.md](VM_MIGRATION_PLAN.md).

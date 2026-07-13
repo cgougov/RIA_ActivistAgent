@@ -1,31 +1,56 @@
 """The terminal. One entrypoint for the whole pipeline:
 
   fund init                      create the database
+  fund migrate                   apply schema/data migrations explicitly
   fund status                    pipeline state at a glance
   fund list                      every fund, its typeable name, and review state
+  fund inbox                     pending review queue with suggested commands
+  fund next                      the next useful command for the current DB state
+  fund doctor                    environment and DB sanity check
   fund ingest                    absorb PDFs (funds/docs from data/seed)
+  fund add-doc --fund simplex --type factsheet --date 2026-06-30 path.pdf
+                                 register a new current source document
   fund extract DOC [...]         LLM: propose facts / return rows
+  fund verify [--doc DOC]        deterministic quote verification backfill
+  fund reconcile NAME            deterministic return-number QC
   fund review NAME               review a fund's whole proposed factsheet at once
   fund factsheet NAME            the standardized factsheet (returns at the bottom)
   fund returns NAME              approved return history
+  fund screen                    deterministic approved-data screener
   fund compare NAME NAME [...]   deterministic side-by-side, common period only
+  fund export NAME               Markdown factsheet export
   fund analyze --funds a,b -q Q  LLM analysis on approved truth
+  fund analyze-activism --funds a,b  web-backed stated-vs-observed activism check
   fund analyses / show / log     saved analyses and the LLM call log
 
 Funds can be named by a handle (simplex, begonia) instead of fund_002.
 """
 import argparse
 import json
+import os
 import sys
+from importlib import metadata
+from pathlib import Path
 
 from fund import analyze as analyze_mod
 from fund import compare as compare_mod
+from fund import export as export_mod
 from fund import extract as extract_mod
 from fund import factsheet as factsheet_mod
 from fund import ingest as ingest_mod
 from fund import review as review_mod
-from fund.config import DB_PATH
-from fund.db import connect, create_schema
+from fund import screen as screen_mod
+from fund import similarity as similarity_mod
+from fund import verification as verification_mod
+from fund.config import DB_PATH, PAGE_IMAGE_DIR, PDF_DIR
+from fund.db import (
+    CURRENT_SCHEMA_VERSION,
+    backup_database,
+    connect,
+    create_schema,
+    current_schema_version,
+    migrate_to_latest,
+)
 
 
 def resolve_fund(conn, token):
@@ -47,25 +72,212 @@ def resolve_fund(conn, token):
     return matches[0]["fund_id"]
 
 
+def _fund_handle(fund_name):
+    return compare_mod.short_name(fund_name)
+
+
+def _pending_conflicts(conn, fund_id):
+    proposals = review_mod.pending_proposals(conn, fund_id=fund_id)
+    if not proposals:
+        return 0, 0
+    meta = review_mod.doc_meta(conn, fund_id)
+    _, superseded = review_mod.resolve_field_conflicts(proposals, meta)
+    groups = {}
+    for row in proposals:
+        groups.setdefault((row["field_key"], row.get("share_class") or ""), []).append(row)
+    conflict_rows = sum(len(rows) for rows in groups.values() if len(rows) > 1)
+    return conflict_rows, len(superseded)
+
+
+def workflow_inbox(conn):
+    """Current work queue, grouped by fund, with enough state to choose next action."""
+    rows = conn.execute(
+        """SELECT f.fund_id, f.fund_name, f.manager_name,
+                  (SELECT COUNT(*) FROM facts WHERE fund_id = f.fund_id) AS facts,
+                  (SELECT COUNT(*) FROM returns WHERE fund_id = f.fund_id) AS returns_count,
+                  (SELECT COUNT(*) FROM proposals WHERE fund_id = f.fund_id AND status='pending') AS pending,
+                  (SELECT COUNT(*) FROM proposals
+                   WHERE fund_id = f.fund_id AND status='pending' AND quote_verified = 1) AS verified,
+                  (SELECT COUNT(*) FROM proposals
+                   WHERE fund_id = f.fund_id AND status='pending'
+                     AND COALESCE(quote_verified, 0) != 1) AS unverified,
+                  (SELECT COUNT(*) FROM proposed_returns
+                   WHERE fund_id = f.fund_id AND status='pending') AS pending_returns,
+                  (SELECT COUNT(*) FROM documents WHERE fund_id = f.fund_id) AS docs
+           FROM funds f ORDER BY f.fund_id"""
+    ).fetchall()
+    inbox = []
+    for row in rows:
+        item = dict(row)
+        item["handle"] = _fund_handle(row["fund_name"])
+        item["conflict_rows"], item["superseded"] = _pending_conflicts(conn, row["fund_id"])
+        scopes = conn.execute(
+            """SELECT scope, COUNT(*) AS count
+               FROM proposals
+               WHERE fund_id = ? AND status='pending'
+               GROUP BY scope ORDER BY scope""",
+            (row["fund_id"],),
+        ).fetchall()
+        item["scopes"] = {scope["scope"]: scope["count"] for scope in scopes}
+        inbox.append(item)
+    return inbox
+
+
+def format_inbox(inbox):
+    lines = [
+        "Review inbox",
+        "------------",
+        f"  {'handle':<12} {'fund_id':<10} {'facts':>5} {'returns':>7} {'pending':>8} "
+        f"{'verified':>8} {'conflict':>8}  next",
+    ]
+    active = False
+    for row in inbox:
+        pending_total = row["pending"] + row["pending_returns"]
+        if not pending_total:
+            continue
+        active = True
+        if row["pending"]:
+            next_cmd = f"fund review {row['handle']} --list"
+        else:
+            next_cmd = f"fund review {row['handle']}"
+        lines.append(
+            f"  {row['handle']:<12} {row['fund_id']:<10} {row['facts']:>5} "
+            f"{row['returns_count']:>7} {pending_total:>8} {row['verified']:>8} "
+            f"{row['conflict_rows']:>8}  {next_cmd}"
+        )
+        if row["scopes"]:
+            scope_text = ", ".join(f"{scope}:{count}" for scope, count in row["scopes"].items())
+            lines.append(f"  {'':<12} {'':<10} {'':>5} {'':>7} {'':>8} {'':>8} {'':>8}  {scope_text}")
+    if not active:
+        lines.append("  Nothing pending.")
+    return "\n".join(lines)
+
+
+def workflow_next(conn):
+    version = current_schema_version(conn)
+    if version != CURRENT_SCHEMA_VERSION:
+        return {
+            "kind": "migrate",
+            "message": f"Schema is v{version}; current is v{CURRENT_SCHEMA_VERSION}.",
+            "command": "fund migrate",
+        }
+    inbox = workflow_inbox(conn)
+    pending = [row for row in inbox if row["pending"] or row["pending_returns"]]
+    if pending:
+        pending.sort(key=lambda r: (r["unverified"] > 0, r["conflict_rows"], -r["verified"], r["fund_id"]))
+        row = pending[0]
+        return {
+            "kind": "review",
+            "fund_id": row["fund_id"],
+            "handle": row["handle"],
+            "message": (
+                f"{row['fund_name']} has {row['pending']} pending facts and "
+                f"{row['pending_returns']} pending return rows."
+            ),
+            "command": f"fund review {row['handle']} --list",
+        }
+    unapproved = [row for row in inbox if row["facts"] == 0 and row["docs"]]
+    if unapproved:
+        row = unapproved[0]
+        return {
+            "kind": "onboard",
+            "fund_id": row["fund_id"],
+            "handle": row["handle"],
+            "message": f"{row['fund_name']} has documents but no approved facts.",
+            "command": f"fund onboard {row['handle']} --dry-run",
+        }
+    return {
+        "kind": "ready",
+        "message": "No pending review queue. Approved data is ready for factsheets, screens, comparisons, or analysis.",
+        "command": "fund screen --sort \"annualized_sharpe desc\"",
+    }
+
+
+def format_next(next_item):
+    return f"Next action\n-----------\n{next_item['message']}\n\nRun: {next_item['command']}"
+
+
 def cmd_init(args):
-    with connect() as conn:
-        create_schema(conn)
-    print(f"Database ready: {DB_PATH}")
+    with connect(verify=False) as conn:
+        table_count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        version = current_schema_version(conn)
+        if table_count == 0:
+            create_schema(conn)
+            print(f"Database ready: {DB_PATH}")
+            return
+        if version == CURRENT_SCHEMA_VERSION:
+            print(f"Database already initialized: {DB_PATH} (schema v{version})")
+            return
+        raise RuntimeError(
+            "Database exists but is not on the current schema. Run: fund migrate"
+        )
+
+
+def cmd_migrate(args):
+    backup_path = backup_database()
+    with connect(verify=False) as conn:
+        result = migrate_to_latest(conn)
+    if backup_path:
+        print(f"Backup: {backup_path}")
+    if result["created"]:
+        print(f"Initialized database at schema v{result['version']}")
+    elif result["migrated"]:
+        print(f"Migrated database to schema v{result['version']}")
+    else:
+        print(f"Schema already current (v{result['version']})")
+
+
+def _dir_stats(root, suffix):
+    if not root.exists():
+        return {"count": 0, "bytes": 0}
+    paths = [path for path in root.rglob(suffix) if path.is_file()]
+    return {
+        "count": len(paths),
+        "bytes": sum(path.stat().st_size for path in paths),
+    }
 
 
 def cmd_status(args):
     with connect() as conn:
+        version = current_schema_version(conn)
         counts = {
             table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in ("funds", "documents", "pages", "proposals", "proposed_returns",
-                          "facts", "returns", "llm_calls", "analyses")
+                          "facts", "returns", "llm_calls", "analyses", "snapshot_embeddings")
         }
         pending = conn.execute("SELECT COUNT(*) FROM proposals WHERE status='pending'").fetchone()[0]
         pending_ret = conn.execute("SELECT COUNT(*) FROM proposed_returns WHERE status='pending'").fetchone()[0]
+        verified_pending = conn.execute(
+            "SELECT COUNT(*) FROM proposals WHERE status='pending' AND quote_verified = 1"
+        ).fetchone()[0]
+        unverified_pending = conn.execute(
+            """SELECT COUNT(*) FROM proposals
+               WHERE status='pending' AND COALESCE(quote_verified, 0) != 1"""
+        ).fetchone()[0]
+        current_docs = conn.execute(
+            "SELECT doc_type, COUNT(*) AS count FROM documents WHERE is_current = 1 GROUP BY doc_type"
+        ).fetchall()
+        current_by_type = {row["doc_type"]: row["count"] for row in current_docs}
+        pdf_stats = _dir_stats(PDF_DIR, "*.pdf")
+        image_stats = _dir_stats(PAGE_IMAGE_DIR, "*.png")
         print(f"Database: {DB_PATH}")
+        print(f"Schema version: {version}")
         for table, count in counts.items():
             print(f"  {table:<18} {count}")
         print(f"\nPending review: {pending} proposals, {pending_ret} return rows")
+        print(f"Quote verification: {verified_pending} verified pending facts, "
+              f"{unverified_pending} not verified/not checked")
+        print(
+            f"\nStorage: {pdf_stats['count']} PDFs ({pdf_stats['bytes'] / 1e6:.1f} MB), "
+            f"{image_stats['count']} cached page images ({image_stats['bytes'] / 1e6:.1f} MB)"
+        )
+        print(
+            "Current documents: "
+            f"factsheets={current_by_type.get('factsheet', 0)}, "
+            f"presentations={current_by_type.get('presentation', 0)}"
+        )
         rows = conn.execute(
             """SELECT f.fund_id, f.fund_name,
                       (SELECT COUNT(*) FROM facts WHERE fund_id = f.fund_id) AS facts,
@@ -98,6 +310,60 @@ def cmd_list(args):
               f"{row['returns']:>7} {pending:>8}  {row['fund_name']}  [{state}]")
 
 
+def cmd_inbox(args):
+    with connect() as conn:
+        inbox = workflow_inbox(conn)
+    if args.json:
+        print(json.dumps(inbox, indent=2))
+    else:
+        print(format_inbox(inbox))
+
+
+def cmd_next(args):
+    with connect() as conn:
+        next_item = workflow_next(conn)
+    if args.json:
+        print(json.dumps(next_item, indent=2))
+    else:
+        print(format_next(next_item))
+
+
+def cmd_doctor(args):
+    with connect(verify=False) as conn:
+        version = current_schema_version(conn)
+        table_count = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchone()[0]
+        pending = 0
+        pending_returns = 0
+        if version is not None:
+            pending = conn.execute("SELECT COUNT(*) FROM proposals WHERE status='pending'").fetchone()[0]
+            pending_returns = conn.execute(
+                "SELECT COUNT(*) FROM proposed_returns WHERE status='pending'"
+            ).fetchone()[0]
+    try:
+        package_version = metadata.version("fund")
+    except metadata.PackageNotFoundError:
+        package_version = "editable/local"
+    print("Doctor")
+    print("------")
+    print(f"DB path: {DB_PATH}")
+    print(f"Schema: {version or 'not initialized'} / current {CURRENT_SCHEMA_VERSION}")
+    print(f"Tables: {table_count}")
+    print(f"Python: {sys.executable}")
+    print(f"Package: fund {package_version}")
+    print(f"OPENAI_API_KEY: {'set' if os.getenv('OPENAI_API_KEY') else 'missing'}")
+    print(f"Pending review: {pending} facts, {pending_returns} return rows")
+    if table_count == 0:
+        print("\nRun: fund init")
+    elif version != CURRENT_SCHEMA_VERSION:
+        print("\nRun: fund migrate")
+    elif pending or pending_returns:
+        print("\nRun: fund inbox")
+    else:
+        print("\nLooks ready. Run: fund next")
+
+
 def cmd_prune(args):
     with connect() as conn:
         doc_id = args.doc
@@ -114,10 +380,59 @@ def cmd_prune(args):
 
 def cmd_ingest(args):
     with connect() as conn:
-        create_schema(conn)
         results = ingest_mod.ingest_from_seeds(conn)
     for result in results:
         print(f"  {result['doc_id']}: {result['status']} ({result['pages']} pages)")
+
+
+def cmd_add_doc(args):
+    with connect() as conn:
+        fund_id = resolve_fund(conn, args.fund)
+        result = ingest_mod.add_document(
+            conn,
+            fund_id,
+            args.type,
+            args.date,
+            Path(args.path),
+            title=args.title,
+        )
+    print(f"Added {result['doc_type']} for {fund_id}: {result['doc_id']}")
+    print(f"  stored: {result['stored_path']}")
+    print(f"  pages: {result['pages']}")
+    if result["supersedes_doc_id"]:
+        print(f"  current lineage: supersedes {result['supersedes_doc_id']}")
+    print(f"Next: fund onboard {args.fund} --dry-run")
+
+
+def cmd_verify(args):
+    with connect() as conn:
+        doc_id = args.doc
+        if doc_id and not conn.execute(
+            "SELECT 1 FROM documents WHERE doc_id = ?",
+            (doc_id,),
+        ).fetchone():
+            raise ValueError(f"No document {doc_id}")
+        counts = verification_mod.verify_existing(conn, doc_id=doc_id)
+    print("Quote verification complete.")
+    if not counts:
+        print("  No staged proposals or return rows found.")
+        return
+    for key in sorted(counts):
+        print(f"  {key:<24} {counts[key]}")
+
+
+def cmd_reconcile(args):
+    with connect() as conn:
+        fund_id = resolve_fund(conn, args.fund)
+        fund = conn.execute("SELECT fund_name FROM funds WHERE fund_id = ?", (fund_id,)).fetchone()
+        issues = verification_mod.reconcile_returns(
+            conn,
+            fund_id,
+            threshold_pp=args.threshold,
+            monthly_bound=args.monthly_bound,
+        )
+    label = f"{compare_mod.short_name(fund['fund_name'])} ({fund_id})"
+    print(verification_mod.format_reconciliation(issues, label))
 
 
 def cmd_extract(args):
@@ -176,17 +491,49 @@ def cmd_onboard(args):
     print(f"\nReview when ready:  fund review {handle}")
 
 
-def _print_proposal(row, index=None, total=None):
+def _approved_fact_for_row(conn, row):
+    return conn.execute(
+        """SELECT value, doc_id, page, approved_at FROM facts
+           WHERE fund_id = ? AND field_key = ? AND share_class = ?""",
+        (row["fund_id"], row["field_key"], row.get("share_class") or ""),
+    ).fetchone()
+
+
+def _print_proposal(row, index=None, total=None, approved=None):
     head = f"[{index}/{total}] " if index else ""
-    print(f"\n{head}{row['field_key']}  ({row['scope']}, {row['doc_id']} p.{row['page']})")
+    qualifier = f" [{row['share_class']}]" if row.get("share_class") else ""
+    print(f"\n{head}{row['field_key']}{qualifier}  ({row['scope']}, {row['doc_id']} p.{row['page']})")
     print(f"  value: {row['value']}")
+    if approved:
+        print(f"  current: {approved['value']}  ({approved['doc_id']} p.{approved['page']})")
     if row["unit"]:
         print(f"  unit: {row['unit']}")
     if row["as_of_date"]:
         print(f"  as of: {row['as_of_date']}")
     if row["quote"]:
         print(f"  quote: {row['quote'][:200]}")
+    print(f"  quote check: {verification_mod.verification_label(row)}")
     print(f"  id: {row['proposal_id']}")
+
+
+def _approve_verified(conn, proposals, reviewer):
+    meta = review_mod.doc_meta(conn, proposals[0]["fund_id"]) if proposals else {}
+    _, superseded = review_mod.resolve_field_conflicts(proposals, meta)
+    groups = {}
+    for row in proposals:
+        groups.setdefault((row["field_key"], row.get("share_class") or ""), []).append(row)
+    approved, skipped = 0, []
+    for row in proposals:
+        group = groups[(row["field_key"], row.get("share_class") or "")]
+        if row["proposal_id"] in superseded or len(group) > 1:
+            skipped.append((row["proposal_id"], "conflict"))
+            continue
+        if row.get("quote_verified") != 1:
+            skipped.append((row["proposal_id"], "quote not verified"))
+            continue
+        review_mod.approve_proposal(conn, row["proposal_id"], reviewer)
+        approved += 1
+    return approved, skipped
 
 
 def cmd_review(args):
@@ -233,13 +580,31 @@ def cmd_review(args):
             print("Nothing pending.")
             return
 
+        if args.summary:
+            if fund_id:
+                print(format_inbox([row for row in workflow_inbox(conn) if row["fund_id"] == fund_id]))
+            else:
+                print(f"Pending facts: {len(proposals)}")
+                print(f"Pending return rows: {len(returns)}")
+            return
+
+        if args.approve_verified:
+            if not fund_id:
+                raise ValueError("--approve-verified requires a fund target")
+            approved, skipped = _approve_verified(conn, proposals, args.reviewer)
+            conn.commit()
+            print(f"Approved {approved} verified, non-conflicting proposals.")
+            if skipped:
+                print(f"Skipped {len(skipped)} proposals needing manual review.")
+            return
+
         # Show the whole proposed factsheet at once (grouped by section, incl. returns).
         if fund_id:
             print(factsheet_mod.format_proposed_factsheet(
                 factsheet_mod.build_proposed_factsheet(conn, fund_id)))
         else:
             for row in proposals:
-                _print_proposal(row)
+                _print_proposal(row, approved=_approved_fact_for_row(conn, row))
             if returns:
                 print(f"\nPending return rows ({len(returns)}):")
                 for row in returns:
@@ -258,7 +623,10 @@ def cmd_review(args):
             approved, stale = 0, 0
             for row in proposals:
                 winner = superseded.get(row["proposal_id"])
-                if row["proposal_id"] in reject_ids or row["field_key"] in reject_ids:
+                reject_tokens = {row["proposal_id"], row["field_key"]}
+                if row.get("share_class"):
+                    reject_tokens.add(f"{row['field_key']}[{row['share_class']}]")
+                if reject_ids & reject_tokens:
                     review_mod.reject_proposal(conn, row["proposal_id"], args.reviewer)
                 elif winner:
                     review_mod.reject_proposal(
@@ -292,7 +660,7 @@ def cmd_review(args):
             approve_all(reject_ids=frozenset(raw))
         elif choice == "f":
             for index, row in enumerate(proposals, start=1):
-                _print_proposal(row, index, len(proposals))
+                _print_proposal(row, index, len(proposals), approved=_approved_fact_for_row(conn, row))
                 pick = input("  [a]pprove / [e]dit+approve / [r]eject / [s]kip / [q]uit > ").strip().lower()
                 if pick == "q":
                     break
@@ -314,6 +682,56 @@ def cmd_review(args):
                 print(f"Approved {len(returns)} return rows.")
 
 
+def cmd_pending(args):
+    args.list = True
+    args.approve_id = None
+    args.reject_id = None
+    args.reopen_id = None
+    args.approve_return_id = None
+    args.reject_return_id = None
+    args.approve_all = False
+    args.approve_verified = False
+    args.summary = False
+    args.value = None
+    args.note = ""
+    cmd_review(args)
+
+
+def cmd_approve(args):
+    with connect() as conn:
+        try:
+            key = review_mod.approve_proposal(
+                conn,
+                args.proposal_id,
+                args.reviewer,
+                value=args.value,
+                note=args.note,
+            )
+            conn.commit()
+            print(f"approved -> facts.{key}")
+        except ValueError:
+            outcome = review_mod.approve_return_row(
+                conn,
+                args.proposal_id,
+                args.reviewer,
+                note=args.note,
+            )
+            conn.commit()
+            print(f"approved return row ({outcome})")
+
+
+def cmd_reject(args):
+    with connect() as conn:
+        try:
+            review_mod.reject_proposal(conn, args.proposal_id, args.reviewer, note=args.note)
+            conn.commit()
+            print("rejected")
+        except ValueError:
+            review_mod.reject_return_row(conn, args.proposal_id, args.reviewer, note=args.note)
+            conn.commit()
+            print("rejected return row")
+
+
 def cmd_factsheet(args):
     with connect() as conn:
         fund_id = resolve_fund(conn, args.fund)
@@ -331,18 +749,89 @@ def cmd_returns(args):
     print(factsheet_mod.format_returns_table(sheet["returns"]))
 
 
+def cmd_screen(args):
+    sort_field, descending = None, True
+    if args.sort:
+        parts = args.sort.split()
+        sort_field = parts[0]
+        if len(parts) > 1:
+            descending = parts[1].lower() != "asc"
+    with connect() as conn:
+        result = screen_mod.screen_funds(
+            conn,
+            where=args.where,
+            preset=args.preset,
+            min_history_years=args.min_history,
+            sort_field=sort_field,
+            descending=descending,
+        )
+    print(screen_mod.format_screen(result))
+
+
+def cmd_similar(args):
+    with connect() as conn:
+        if args.all:
+            result = similarity_mod.all_pairwise_similarity(conn)
+            print(similarity_mod.format_pairwise(result, limit=args.limit))
+            return
+        if not args.fund:
+            raise ValueError("Usage: fund similar FUND or fund similar --all")
+        fund_id = resolve_fund(conn, args.fund)
+        result = similarity_mod.similar_funds(conn, fund_id, limit=args.limit)
+    print(similarity_mod.format_similar(result))
+
+
 def cmd_compare(args):
     fields = args.fields.split(",") if args.fields else None
     with connect() as conn:
         fund_ids = [resolve_fund(conn, token) for token in args.funds]
         comparison = compare_mod.compare_funds(conn, fund_ids, field_keys=fields)
+        similarity = None
+        if args.embedding_similarity:
+            similarity = analyze_mod.factsheet_embedding_similarity(conn, fund_ids, dry_run=args.dry_run)
     print(compare_mod.format_comparison(comparison))
+    if args.embedding_similarity:
+        if args.dry_run:
+            print("\nEmbedding similarity dry-run:")
+            print(json.dumps(similarity, indent=2))
+        else:
+            print("\nFactsheet embedding similarity:")
+            print(f"  model: {similarity['model']}")
+            for pair in similarity["pairs"]:
+                print(f"  {pair['left']} vs {pair['right']}: {pair['cosine_similarity']}")
+
+
+def cmd_export(args):
+    with connect() as conn:
+        if args.target[0] == "compare":
+            if len(args.target) < 3:
+                raise ValueError("Usage: fund export compare FUND FUND [FUND ...]")
+            fund_ids = [resolve_fund(conn, token) for token in args.target[1:]]
+            print(export_mod.markdown_compare(conn, fund_ids), end="")
+            return
+        if len(args.target) != 1:
+            raise ValueError("Usage: fund export FUND or fund export compare FUND FUND [FUND ...]")
+        fund_id = resolve_fund(conn, args.target[0])
+        sheet = factsheet_mod.build_factsheet(conn, fund_id)
+        peers = export_mod.peer_context(conn, fund_id) if args.peer_context else {}
+    print(export_mod.markdown_factsheet(sheet, peer=peers), end="")
 
 
 def cmd_analyze(args):
     with connect() as conn:
         fund_ids = [resolve_fund(conn, token) for token in args.funds.split(",")]
         result = analyze_mod.run_analysis(conn, fund_ids, args.question, dry_run=args.dry_run)
+    if args.dry_run:
+        print(json.dumps(result, indent=2))
+    else:
+        print(f"[{result['analysis_id']}] snapshots: {', '.join(result['snapshot_hashes'])}\n")
+        print(result["output_text"])
+
+
+def cmd_analyze_activism(args):
+    with connect() as conn:
+        fund_ids = [resolve_fund(conn, token) for token in args.funds.split(",")]
+        result = analyze_mod.run_activism_reality_analysis(conn, fund_ids, dry_run=args.dry_run)
     if args.dry_run:
         print(json.dumps(result, indent=2))
     else:
@@ -388,9 +877,39 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init").set_defaults(func=cmd_init)
+    sub.add_parser("migrate").set_defaults(func=cmd_migrate)
     sub.add_parser("status").set_defaults(func=cmd_status)
     sub.add_parser("list").set_defaults(func=cmd_list)
+    p = sub.add_parser("inbox", help="pending review queue grouped by fund")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_inbox)
+
+    p = sub.add_parser("next", help="suggest the next useful workflow action")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_next)
+
+    sub.add_parser("doctor", help="environment and database sanity check").set_defaults(func=cmd_doctor)
     sub.add_parser("ingest").set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("add-doc", help="register a new current factsheet or presentation")
+    p.add_argument("--fund", required=True, help="fund name (e.g. simplex) or id")
+    p.add_argument("--type", required=True, choices=("factsheet", "presentation"))
+    p.add_argument("--date", required=True, help="document date as YYYY-MM-DD when known")
+    p.add_argument("--title", help="optional document title override")
+    p.add_argument("path", help="path to the PDF to register")
+    p.set_defaults(func=cmd_add_doc)
+
+    p = sub.add_parser("verify", help="backfill quote verification for staged proposals/returns")
+    p.add_argument("--doc", help="limit to one document id")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("reconcile", help="deterministic return-number QC for one fund")
+    p.add_argument("fund", help="fund name (e.g. simplex) or id")
+    p.add_argument("--threshold", type=float, default=0.5,
+                   help="flag annual/YTD deltas above this many percentage points")
+    p.add_argument("--monthly-bound", type=float, default=60.0,
+                   help="flag monthly returns outside +/- this percent")
+    p.set_defaults(func=cmd_reconcile)
 
     p = sub.add_parser("prune", help="delete cached page images (regenerated on demand)")
     p.add_argument("--doc", help="limit to one document id")
@@ -427,9 +946,31 @@ def main():
     p.add_argument("--reject-return-id")
     p.add_argument("--approve-all", action="store_true",
                    help="approve everything pending for the target (review the list first)")
+    p.add_argument("--approve-verified", action="store_true",
+                   help="approve verified proposals with no field conflicts")
+    p.add_argument("--summary", action="store_true",
+                   help="show counts for this review target")
     p.add_argument("--value")
     p.add_argument("--note", default="")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("pending", help="friendlier alias for: fund review TARGET --list")
+    p.add_argument("target", help="fund name (e.g. simplex) or a doc id")
+    p.add_argument("--reviewer", default="christian")
+    p.set_defaults(func=cmd_pending)
+
+    p = sub.add_parser("approve", help="approve one proposal or return row id")
+    p.add_argument("proposal_id")
+    p.add_argument("--reviewer", default="christian")
+    p.add_argument("--value")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_approve)
+
+    p = sub.add_parser("reject", help="reject one proposal or return row id")
+    p.add_argument("proposal_id")
+    p.add_argument("--reviewer", default="christian")
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_reject)
 
     p = sub.add_parser("factsheet")
     p.add_argument("fund", help="fund name (e.g. simplex) or id")
@@ -441,16 +982,46 @@ def main():
     p.add_argument("fund", help="fund name (e.g. simplex) or id")
     p.set_defaults(func=cmd_returns)
 
+    p = sub.add_parser("screen", help="screen funds using approved facts and computed analytics")
+    p.add_argument("--preset", choices=sorted(screen_mod.PRESETS))
+    p.add_argument("--where", action="append",
+                   help="numeric filter, e.g. management_fee<1.5 or annualized_sharpe>=1")
+    p.add_argument("--min-history", type=float, help="minimum monthly return history in years")
+    p.add_argument("--sort", help='sort expression, e.g. "annualized_sharpe desc"')
+    p.set_defaults(func=cmd_screen)
+
+    p = sub.add_parser("similar", help="rank qualitative similarity using approved facts")
+    p.add_argument("fund", nargs="?", help="fund name (e.g. simplex) or id")
+    p.add_argument("--all", action="store_true", help="rank all fund pairs")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(func=cmd_similar)
+
     p = sub.add_parser("compare")
     p.add_argument("funds", nargs="+", help="fund names (e.g. simplex begonia) or ids")
     p.add_argument("--fields")
+    p.add_argument("--embedding-similarity", action="store_true",
+                   help="also compare factsheet snapshot embeddings")
+    p.add_argument("--dry-run", action="store_true",
+                   help="for embedding similarity only, show payload sizes without an API call")
     p.set_defaults(func=cmd_compare)
+
+    p = sub.add_parser("export", help="export approved factsheet or comparison as Markdown")
+    p.add_argument("target", nargs="+",
+                   help="FUND, or: compare FUND FUND [FUND ...]")
+    p.add_argument("--no-peer-context", dest="peer_context", action="store_false",
+                   help="omit peer-relative computed-stat context for single-fund exports")
+    p.set_defaults(func=cmd_export, peer_context=True)
 
     p = sub.add_parser("analyze")
     p.add_argument("--funds", required=True, help="comma-separated fund names or ids")
     p.add_argument("-q", "--question", required=True)
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(func=cmd_analyze)
+
+    p = sub.add_parser("analyze-activism")
+    p.add_argument("--funds", required=True, help="comma-separated fund names or ids")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(func=cmd_analyze_activism)
 
     sub.add_parser("analyses").set_defaults(func=cmd_analyses)
 

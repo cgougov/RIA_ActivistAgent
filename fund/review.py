@@ -1,9 +1,9 @@
 """Stage 3 of the pipeline: human approval (proposals -> source of truth).
 
-Approving a descriptive proposal upserts into facts — the (fund_id, field_key)
-primary key makes duplicates structurally impossible; re-approving a field is
-a revision, not a second row. Approving a return row upserts into returns the
-same way, preferring net over gross over unknown when a period already exists
+Approving a descriptive proposal upserts into facts — the
+(fund_id, field_key, share_class) primary key makes duplicates structurally
+impossible; re-approving a field is a revision, not a second row. Approving a
+return row upserts into returns the same way, preferring net over gross over unknown when a period already exists
 (the one good dedup pattern from the legacy system, kept).
 """
 from fund.db import utc_now
@@ -16,9 +16,9 @@ _RETURN_QUALITY = {"net": 2, "gross": 1, "unknown": 0}
 def doc_meta(connection, fund_id):
     """doc_id -> {date, type} for a fund. Drives conflict resolution (fact sheet
     beats presentation, then recency) and source provenance on the factsheet."""
-    return {row["doc_id"]: {"date": row["doc_date"], "type": row["doc_type"]}
+    return {row["doc_id"]: {"date": row["doc_date"], "type": row["doc_type"], "is_current": row["is_current"]}
             for row in connection.execute(
-                "SELECT doc_id, doc_date, doc_type FROM documents WHERE fund_id = ?", (fund_id,))}
+                "SELECT doc_id, doc_date, doc_type, is_current FROM documents WHERE fund_id = ?", (fund_id,))}
 
 
 def _rank_key(proposal, meta):
@@ -27,7 +27,8 @@ def _rank_key(proposal, meta):
     then later extraction. Undated/unknown docs sort lowest."""
     info = meta.get(proposal["doc_id"], {})
     is_factsheet = 1 if info.get("type") == "factsheet" else 0
-    return (is_factsheet, info.get("date") or "",
+    is_current = 1 if info.get("is_current") else 0
+    return (is_factsheet, is_current, info.get("date") or "",
             proposal.get("confidence") or 0.0, proposal.get("created_at") or "")
 
 
@@ -38,7 +39,7 @@ def resolve_field_conflicts(proposals, meta):
     the winning proposal that beat it."""
     by_field = {}
     for prop in proposals:
-        by_field.setdefault(prop["field_key"], []).append(prop)
+        by_field.setdefault((prop["field_key"], prop.get("share_class") or ""), []).append(prop)
     winner_ids, superseded = set(), {}
     for group in by_field.values():
         ranked = sorted(group, key=lambda p: _rank_key(p, meta), reverse=True)
@@ -57,7 +58,9 @@ def pending_proposals(connection, doc_id=None, fund_id=None):
         where.append("fund_id = ?")
         params.append(fund_id)
     return [dict(row) for row in connection.execute(
-        f"SELECT * FROM proposals WHERE {' AND '.join(where)} ORDER BY scope, field_key",
+        f"""SELECT * FROM proposals
+            WHERE {' AND '.join(where)}
+            ORDER BY scope, field_key, share_class, created_at""",
         params,
     ).fetchall()]
 
@@ -91,16 +94,16 @@ def approve_proposal(connection, proposal_id, reviewer, value=None, note=""):
 
     connection.execute(
         """
-        INSERT INTO facts (fund_id, field_key, value, value_num, unit, as_of_date,
+        INSERT INTO facts (fund_id, field_key, share_class, value, value_num, unit, as_of_date,
                            doc_id, page, quote, approved_by, approved_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (fund_id, field_key) DO UPDATE SET
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (fund_id, field_key, share_class) DO UPDATE SET
             value = excluded.value, value_num = excluded.value_num, unit = excluded.unit,
             as_of_date = excluded.as_of_date, doc_id = excluded.doc_id, page = excluded.page,
             quote = excluded.quote, approved_by = excluded.approved_by,
             approved_at = excluded.approved_at
         """,
-        (row["fund_id"], row["field_key"], final_value, value_num, row["unit"],
+        (row["fund_id"], row["field_key"], row.get("share_class") or "", final_value, value_num, row["unit"],
          row["as_of_date"], row["doc_id"], row["page"], row["quote"], reviewer, now),
     )
     connection.execute(

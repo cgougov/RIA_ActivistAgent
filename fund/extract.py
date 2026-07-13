@@ -17,7 +17,14 @@ from fund.config import EXTRACT_MODEL
 from fund.db import utc_now
 from fund.ingest import render_page_image
 from fund.llm import call, parse_json
-from fund.schema import FIELDS, SCOPE_GUIDANCE, field_schema_text, fields_for_scope
+from fund.schema import (
+    FIELDS,
+    SCOPE_GUIDANCE,
+    field_schema_text,
+    fields_for_scope,
+    supports_share_class,
+)
+from fund.verification import verify_quote
 
 
 def parse_number(value):
@@ -29,6 +36,17 @@ def parse_number(value):
 
 def _normalize(value):
     return " ".join(str(value).lower().split())
+
+
+def _normalize_share_class(field_key, share_class):
+    if not supports_share_class(field_key):
+        return ""
+    return " ".join(str(share_class or "").split())
+
+
+def _proposal_label(field_key, share_class):
+    share_class = _normalize_share_class(field_key, share_class)
+    return f"{field_key}[{share_class}]" if share_class else field_key
 
 
 def _load_document(connection, doc_id):
@@ -71,10 +89,13 @@ Scope guidance: {SCOPE_GUIDANCE[scope]}
 
 Rules:
 - Do not invent data. Use only the supplied pages.
-- Propose at most ONE value per field — the best-supported one.
+- Propose at most ONE value per field or per field/share class pair — the best-supported one.
 - Every fact must include page_number and a short quoted_text supporting it.
 - If a value is not present in the pages, omit the field entirely. Do not guess.
 - Use only field keys from the list below.
+- If a value applies to a specific share class, include share_class exactly as labeled in the source.
+- Do not collapse multiple share classes into one blended value. Keep class-specific terms or metrics separate.
+- Use share_class only when it materially changes the value. Otherwise set it to null.
 - Return strict JSON: {{"facts": [...]}}
 
 Document: {document['title']} ({document['doc_type']}, date: {document['doc_date'] or 'unknown'})
@@ -85,6 +106,7 @@ Fields for this scope:
 Each fact object:
 {{
   "field_key": "one of the listed keys",
+  "share_class": "Class A | USD | Founder Class | null",
   "value": "the value as written in the source",
   "unit": "percent|currency|date|months|days|null",
   "as_of_date": "YYYY-MM-DD if stated, otherwise null",
@@ -98,17 +120,19 @@ Pages:
 """.strip()
 
 
-def _dedup_against_db(connection, fund_id, field_key, value):
+def _dedup_against_db(connection, fund_id, field_key, value, share_class=""):
     """Return a skip reason if this value is already approved or already pending."""
+    share_class = _normalize_share_class(field_key, share_class)
     fact = connection.execute(
-        "SELECT value FROM facts WHERE fund_id = ? AND field_key = ?", (fund_id, field_key)
+        "SELECT value FROM facts WHERE fund_id = ? AND field_key = ? AND share_class = ?",
+        (fund_id, field_key, share_class),
     ).fetchone()
     if fact and _normalize(fact["value"]) == _normalize(value):
         return "already approved with the same value"
     pending = connection.execute(
         """SELECT value FROM proposals
-           WHERE fund_id = ? AND field_key = ? AND status = 'pending'""",
-        (fund_id, field_key),
+           WHERE fund_id = ? AND field_key = ? AND share_class = ? AND status = 'pending'""",
+        (fund_id, field_key, share_class),
     ).fetchall()
     for row in pending:
         if _normalize(row["value"]) == _normalize(value):
@@ -124,43 +148,59 @@ def save_proposals(connection, document, scope, facts):
     for fact in facts:
         key = str(fact.get("field_key", "")).strip()
         value = str(fact.get("value", "")).strip()
+        share_class = _normalize_share_class(key, fact.get("share_class"))
         if key not in valid_keys:
             skipped.append((key or "?", f"unknown field for scope {scope}"))
             continue
         if not value:
-            skipped.append((key, "empty value"))
+            skipped.append((_proposal_label(key, share_class), "empty value"))
             continue
-        current = best.get(key)
+        dedup_key = (key, share_class)
+        current = best.get(dedup_key)
         if current is None or (fact.get("confidence") or 0) > (current.get("confidence") or 0):
             if current is not None:
-                skipped.append((key, "duplicate in same run (kept higher confidence)"))
-            best[key] = fact
+                skipped.append((_proposal_label(key, share_class), "duplicate in same run (kept higher confidence)"))
+            fact = dict(fact)
+            fact["share_class"] = share_class
+            best[dedup_key] = fact
         else:
-            skipped.append((key, "duplicate in same run (kept higher confidence)"))
+            skipped.append((_proposal_label(key, share_class), "duplicate in same run (kept higher confidence)"))
 
     inserted = []
-    for key, fact in best.items():
+    for (key, share_class), fact in best.items():
         value = str(fact["value"]).strip()
-        reason = _dedup_against_db(connection, document["fund_id"], key, value)
+        reason = _dedup_against_db(connection, document["fund_id"], key, value, share_class=share_class)
         if reason:
-            skipped.append((key, reason))
+            skipped.append((_proposal_label(key, share_class), reason))
             continue
+        verification = verify_quote(
+            connection,
+            doc_id=document["doc_id"],
+            page=fact.get("page_number"),
+            quote=fact.get("quoted_text"),
+            source_mode="text",
+        )
         connection.execute(
             """
-            INSERT INTO proposals (proposal_id, doc_id, fund_id, scope, field_key, value,
+            INSERT INTO proposals (proposal_id, doc_id, fund_id, scope, field_key, share_class, value,
                                    value_num, unit, as_of_date, page, quote, confidence,
+                                   quote_verified, quote_verify_score, quote_verify_status,
                                    created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 f"prop_{uuid4().hex[:12]}", document["doc_id"], document["fund_id"], scope,
-                key, value,
+                key, share_class, value,
                 parse_number(value) if FIELDS[key][2] == "number" else None,
                 fact.get("unit"), fact.get("as_of_date"), fact.get("page_number"),
-                fact.get("quoted_text"), fact.get("confidence"), utc_now(),
+                fact.get("quoted_text"), fact.get("confidence"),
+                verification["quote_verified"],
+                verification["quote_verify_score"],
+                verification["quote_verify_status"],
+                utc_now(),
             ),
         )
-        inserted.append(key)
+        inserted.append(_proposal_label(key, share_class))
     connection.commit()
     return inserted, skipped
 
@@ -213,6 +253,9 @@ Bias toward inclusion under uncertainty (a human approves every row afterwards):
 - Only omit a cell if it is plainly not a periodic return (e.g. an index level, AUM,
   or a cumulative-since-inception line whose per-period value cannot be recovered).
   When in doubt, INCLUDE it with low confidence and note the doubt in quoted_text.
+- The fund's own series may appear beside benchmark or index series. Extract ONLY the
+  fund or share-class series. Do not emit benchmark, index, or comparator rows such as
+  TOPIX, MSCI, Nikkei, S&P, Russell, or other market benchmarks.
 
 Rules:
 - Do not invent numbers. Every row must correspond to a value visible in the image.
@@ -259,12 +302,12 @@ def extract_returns(connection, doc_id, page_number, force=False, dry_run=False)
         doc_id=doc_id, fund_id=document["fund_id"],
     )
     rows = parse_json(call_id, output).get("rows", [])
-    inserted, skipped = _save_return_rows(connection, document, page_number, rows)
+    inserted, skipped = _save_return_rows(connection, document, page_number, rows, source_mode="vision")
     return {"doc_id": doc_id, "page": page_number, "call_id": call_id,
             "proposed": len(rows), "inserted": inserted, "skipped": skipped}
 
 
-def _save_return_rows(connection, document, page_number, rows):
+def _save_return_rows(connection, document, page_number, rows, source_mode="vision"):
     """Validate, dedup and stage proposed return rows. Shared by the vision and
     text return extractors. Returns (inserted_count, skipped_list)."""
     fund_id = document["fund_id"]
@@ -283,6 +326,9 @@ def _save_return_rows(connection, document, page_number, rows):
             skipped.append((index, "missing return_value"))
             continue
         share_class = (row.get("share_class") or "").strip()
+        if _looks_like_benchmark(share_class, row.get("quoted_text")):
+            skipped.append((index, "benchmark/index row"))
+            continue
         duplicate = connection.execute(
             """SELECT 1 FROM proposed_returns
                WHERE fund_id = ? AND share_class = ? AND period_type = ? AND period_end = ?
@@ -297,23 +343,51 @@ def _save_return_rows(connection, document, page_number, rows):
         if duplicate:
             skipped.append((index, f"{period_type} {period_end} already staged or approved"))
             continue
+        verification = verify_quote(
+            connection,
+            doc_id=document["doc_id"],
+            page=page_number,
+            quote=row.get("quoted_text"),
+            source_mode=source_mode,
+        )
         connection.execute(
             """
             INSERT INTO proposed_returns (row_id, doc_id, fund_id, period_type, period_start,
                                           period_end, return_pct, return_type, share_class,
-                                          page, quote, confidence, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                          page, quote, confidence, quote_verified,
+                                          quote_verify_score, quote_verify_status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 f"ret_{uuid4().hex[:12]}", document["doc_id"], fund_id, period_type,
                 row.get("period_start_date"), period_end, value,
                 (row.get("return_type") or "unknown").lower(), share_class,
-                page_number, row.get("quoted_text"), row.get("confidence"), utc_now(),
+                page_number, row.get("quoted_text"), row.get("confidence"),
+                verification["quote_verified"],
+                verification["quote_verify_score"],
+                verification["quote_verify_status"],
+                utc_now(),
             ),
         )
         inserted += 1
     connection.commit()
     return inserted, skipped
+
+
+def _looks_like_benchmark(label, quote=None):
+    text = " ".join(part for part in [label or "", quote or ""] if part).lower()
+    benchmark_terms = (
+        " benchmark",
+        " index",
+        "topix",
+        "msci",
+        "nikkei",
+        "s&p",
+        "russell",
+        "ftse",
+        "jp small cap",
+    )
+    return any(term in text for term in benchmark_terms)
 
 
 RETURNS_TEXT_NOTE = """
@@ -360,7 +434,7 @@ def extract_returns_from_text(connection, doc_id, page_number, force=False, dry_
         prompt_input=prompt, doc_id=doc_id, fund_id=document["fund_id"],
     )
     rows = parse_json(call_id, output).get("rows", [])
-    inserted, skipped = _save_return_rows(connection, document, page_number, rows)
+    inserted, skipped = _save_return_rows(connection, document, page_number, rows, source_mode="text")
     return {"doc_id": doc_id, "page": page_number, "mode": "text", "call_id": call_id,
             "proposed": len(rows), "inserted": inserted, "skipped": skipped}
 

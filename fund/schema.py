@@ -1,8 +1,8 @@
 """The standardized factsheet vocabulary — the single source of truth.
 
-Every descriptive fact in the system is one of these fields. One value per
-field per fund (enforced by the facts table primary key). Returns are the
-one exception: they are time-series rows in their own table.
+Every descriptive fact in the system is one of these fields. Most fields are
+fund-level, but a controlled subset can be qualified by share class. Returns
+are the time-series exception and live in their own table.
 
 Ported and consolidated from the legacy taxonomy (78 definitions), with the
 duplicate machinery removed: no generic person_name/role_title facts, no
@@ -112,7 +112,8 @@ EXTRACTION_SCOPES = {
 SCOPE_GUIDANCE = {
     "profile_terms": (
         "Extract only stable, explicitly disclosed identity, structure, service provider, fee, liquidity, "
-        "and investor-term facts. Prefer one best value per field."
+        "and investor-term facts. Prefer one best value per field or per share class when the source clearly "
+        "states class-specific terms."
     ),
     "strategy_people": (
         "Extract only named people with meaningful roles, concise strategy descriptions, activism style, "
@@ -122,7 +123,8 @@ SCOPE_GUIDANCE = {
     "metrics": (
         "Extract only point-in-time performance metrics such as AUM, NAV, beta, volatility, Sharpe ratio, "
         "information ratio, benchmark correlation, and max drawdown. Do not extract monthly, quarterly, "
-        "annual, or YTD return observations; returns are handled by a separate workflow."
+        "annual, or YTD return observations; returns are handled by a separate workflow. If the source ties a "
+        "metric to a specific share class, preserve that share class."
     ),
     "notes_flags": (
         "Write at most one neutral_summary and at most one differentiating_edge for this document. Extract flags "
@@ -153,3 +155,30 @@ def field_schema_text(scope):
 
 def section_fields(section):
     return [k for k, v in FIELDS.items() if v[0] == section]
+
+
+SHARE_CLASS_FIELDS = {
+    "share_class",
+    "base_currency",
+    "inception_date",
+    "nav",
+    "beta",
+    "volatility",
+    "sharpe_ratio",
+    "information_ratio",
+    "benchmark_correlation",
+    "max_drawdown",
+    "management_fee",
+    "performance_fee",
+    "hurdle",
+    "high_water_mark",
+    "lockup",
+    "redemption_frequency",
+    "notice_period",
+    "gate",
+    "minimum_investment",
+}
+
+
+def supports_share_class(field_key):
+    return field_key in SHARE_CLASS_FIELDS

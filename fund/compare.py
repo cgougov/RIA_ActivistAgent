@@ -5,8 +5,12 @@ Return comparison is always over the COMMON period — the months where every
 compared fund has an approved observation — so the numbers are apples-to-apples.
 Each fund's own full-history stats are still available on its factsheet.
 """
-import statistics
 
+from fund.analytics import (
+    calendar_year_comparison,
+    common_period_statistics,
+    month_key,
+)
 from fund.factsheet import build_factsheet
 from fund.schema import FIELDS, SECTION_ORDER, SECTION_TITLES, section_fields
 
@@ -18,15 +22,20 @@ def compare_funds(connection, fund_ids, field_keys=None):
     for key in keys:
         if key not in FIELDS:
             raise ValueError(f"Unknown field: {key}")
-        values = {}
-        for fund_id, sheet in sheets.items():
-            entry = next(
-                e for e in sheet["sections"][FIELDS[key][0]] if e["field_key"] == key
-            )
-            values[fund_id] = entry["value"]
-        if any(v is not None for v in values.values()):
+        fund_level_values = {fund_id: _entry_value(sheets[fund_id], key) for fund_id in fund_ids}
+        if any(v is not None for v in fund_level_values.values()):
             rows.append({"field_key": key, "label": FIELDS[key][1],
-                         "section": FIELDS[key][0], "values": values})
+                         "section": FIELDS[key][0], "values": fund_level_values})
+        for share_class in _share_classes_for_field(sheets, key):
+            values = {fund_id: _entry_value(sheets[fund_id], key, share_class=share_class) for fund_id in fund_ids}
+            if any(v is not None for v in values.values()):
+                rows.append({
+                    "field_key": key,
+                    "label": f"{FIELDS[key][1]} [{share_class}]",
+                    "section": FIELDS[key][0],
+                    "values": values,
+                    "share_class": share_class,
+                })
     overlap = overlapping_returns(sheets)
     common_stats = common_period_statistics(overlap, fund_ids)
     return {"fund_ids": list(fund_ids), "sheets": sheets, "rows": rows,
@@ -35,118 +44,47 @@ def compare_funds(connection, fund_ids, field_keys=None):
             "own_history_statistics": {fid: sheets[fid]["return_statistics"] for fid in fund_ids}}
 
 
-def _annual_stats(values):
-    """Summary over a fund's annual (calendar-year) returns, in percent points."""
-    if not values:
-        return {"count": 0}
-    stats = {"count": len(values), "average": round(statistics.mean(values), 1),
-             "best": round(max(values), 1), "worst": round(min(values), 1),
-             "cumulative": round((_compound(values) - 1) * 100, 1)}
-    stats["volatility"] = round(statistics.stdev(values), 1) if len(values) > 1 else None
-    return stats
+def _entry_value(sheet, field_key, share_class=""):
+    if share_class:
+        for entry in sheet.get("share_classes", {}).get(share_class, {}).get("sections", {}).get(FIELDS[field_key][0], []):
+            if entry["field_key"] == field_key:
+                return entry["value"]
+        return None
+    entry = next(
+        e for e in sheet["sections"][FIELDS[field_key][0]] if e["field_key"] == field_key
+    )
+    return entry["value"]
 
 
-def _group_by_class(rows):
-    classes = {}
-    for row in rows:
-        classes.setdefault(row["share_class"], []).append(row)
-    return classes
-
-
-def _annual_from_monthly(monthly_rows):
-    """Calendar-year returns compounded from monthly returns — complete years only
-    (12 observations). Deterministic; used when a fund reports no annual figure."""
-    by_year = {}
-    for row in monthly_rows:
-        by_year.setdefault(row["period_end"][:4], []).append(row["return_pct"])
-    return {year: round((_compound(vals) - 1) * 100, 1)
-            for year, vals in by_year.items() if len(vals) == 12}
-
-
-def annual_series(sheets):
-    """One representative annual series per fund. Prefer the fund's reported annual
-    returns (longest share-class series); otherwise compound complete calendar years
-    from monthly returns. Returns (by_fund {year: pct}, class_used, source)."""
-    by_fund, class_used, source = {}, {}, {}
-    for fund_id, sheet in sheets.items():
-        annual = _group_by_class([r for r in sheet["returns"] if r["period_type"] == "annual"])
-        if annual:
-            best = max(annual, key=lambda c: len(annual[c]))
-            by_fund[fund_id] = {row["period_end"][:4]: row["return_pct"] for row in annual[best]}
-            class_used[fund_id], source[fund_id] = best or "(unspecified class)", "reported"
-            continue
-        monthly = _group_by_class([r for r in sheet["returns"] if r["period_type"] == "monthly"])
-        if monthly:
-            best = max(monthly, key=lambda c: len(monthly[c]))
-            computed = _annual_from_monthly(monthly[best])
-            by_fund[fund_id] = computed
-            class_used[fund_id] = (best or "(unspecified class)") if computed else None
-            source[fund_id] = "computed from monthly" if computed else None
-        else:
-            by_fund[fund_id], class_used[fund_id], source[fund_id] = {}, None, None
-    return by_fund, class_used, source
-
-
-def calendar_year_comparison(sheets, fund_ids):
-    """Compare funds on calendar-year (annual) returns — the cleanest apples-to-
-    apples view. Rows span the union of years; stats cover each fund's own history
-    plus the years every fund shares."""
-    by_fund, class_used, source = annual_series(sheets)
-    years = sorted({year for series in by_fund.values() for year in series})
-    rows = [{"year": year, **{fid: by_fund[fid].get(year) for fid in fund_ids}}
-            for year in years]
-    own_stats = {fid: _annual_stats([by_fund[fid][y] for y in sorted(by_fund[fid])])
-                 for fid in fund_ids}
-    common_years = [y for y in years
-                    if all(by_fund[fid].get(y) is not None for fid in fund_ids)]
-    common_stats = {fid: _annual_stats([by_fund[fid][y] for y in common_years])
-                    for fid in fund_ids} if common_years else {}
-    return {"years": years, "rows": rows, "class_used": class_used, "source": source,
-            "own_stats": own_stats, "common_years": common_years,
-            "common_stats": common_stats}
-
-
-def common_period_statistics(overlap, fund_ids):
-    """Return stats computed strictly over the common overlapping months."""
-    if len(overlap) < 2:
-        return {"count": len(overlap), "period_start": None, "period_end": None, "by_fund": {}}
-    by_fund = {}
-    for fund_id in fund_ids:
-        values = [row[fund_id] for row in overlap]
-        average = statistics.mean(values)
-        volatility = statistics.stdev(values)
-        by_fund[fund_id] = {
-            "average": round(average, 1),
-            "volatility": round(volatility, 1),
-            "sharpe_like": round(average / volatility, 1) if volatility else None,
-            "best": round(max(values), 1),
-            "worst": round(min(values), 1),
-            "cumulative": round((_compound(values) - 1) * 100, 1),
-        }
-    return {"count": len(overlap), "period_start": overlap[0]["period_end"],
-            "period_end": overlap[-1]["period_end"], "by_fund": by_fund}
-
-
-def _compound(percent_values):
-    total = 1.0
-    for value in percent_values:
-        total *= (1 + value / 100)
-    return total
+def _share_classes_for_field(sheets, field_key):
+    classes = set()
+    section = FIELDS[field_key][0]
+    for sheet in sheets.values():
+        for share_class, payload in sheet.get("share_classes", {}).items():
+            if any(entry["field_key"] == field_key for entry in payload.get("sections", {}).get(section, [])):
+                classes.add(share_class)
+    return sorted(classes)
 
 
 def overlapping_returns(sheets, period_type="monthly"):
     """Months where every compared fund has an approved observation."""
     by_fund = {}
+    display_period = {}
     for fund_id, sheet in sheets.items():
-        by_fund[fund_id] = {
-            row["period_end"]: row["return_pct"]
-            for row in sheet["returns"] if row["period_type"] == period_type
-        }
+        rows = [row for row in sheet["returns"] if row["period_type"] == period_type]
+        by_month = {}
+        for row in rows:
+            key = month_key(row["period_end"]) if period_type == "monthly" else row["period_end"]
+            if key is None:
+                continue
+            by_month[key] = row["return_pct"]
+            display_period[key] = key
+        by_fund[fund_id] = by_month
     if not by_fund:
         return []
     common = set.intersection(*(set(d) for d in by_fund.values()))
     return [
-        {"period_end": period, **{fund_id: by_fund[fund_id][period] for fund_id in by_fund}}
+        {"period": display_period[period], **{fund_id: by_fund[fund_id][period] for fund_id in by_fund}}
         for period in sorted(common)
     ]
 
@@ -161,6 +99,69 @@ def short_name(fund_name):
     return fund_name.split()[0].lower()
 
 
+def comparison_summary(comparison):
+    fund_ids = comparison["fund_ids"]
+    sheets = comparison["sheets"]
+    names = [sheets[fid]["fund_name"] for fid in fund_ids]
+    lead = ", ".join(names[:-1]) + f", and {names[-1]}" if len(names) > 2 else " and ".join(names)
+
+    def first_value(fid, key):
+        for entry in sheets[fid]["sections"][FIELDS[key][0]]:
+            if entry["field_key"] == key:
+                return entry["value"]
+        return None
+
+    strategy_bits = []
+    for fid in fund_ids[:3]:
+        style = first_value(fid, "activism_style") or first_value(fid, "primary_strategy")
+        if style:
+            strategy_bits.append(f"{short_name(sheets[fid]['fund_name'])} is positioned as {style}")
+    strategy_text = "; ".join(strategy_bits) if strategy_bits else "approved strategy descriptors are limited"
+
+    fee_bits = []
+    for fid in fund_ids[:3]:
+        mgmt = first_value(fid, "management_fee")
+        perf = first_value(fid, "performance_fee")
+        if mgmt or perf:
+            fee_bits.append(
+                f"{short_name(sheets[fid]['fund_name'])} charges {mgmt or 'n/a'} management and {perf or 'n/a'} performance"
+            )
+    fee_text = "; ".join(fee_bits) if fee_bits else "fee disclosures are patchy across the selected funds"
+
+    posture_bits = []
+    for fid in fund_ids[:3]:
+        net = first_value(fid, "net_exposure")
+        aum = first_value(fid, "aum")
+        parts = []
+        if net:
+            parts.append(f"net exposure {net}%")
+        if aum:
+            parts.append(f"AUM {aum}")
+        if parts:
+            posture_bits.append(f"{short_name(sheets[fid]['fund_name'])} reports " + ", ".join(parts))
+    posture_text = "; ".join(posture_bits) if posture_bits else None
+
+    common = comparison["common_period_statistics"]
+    if common["count"] >= 2:
+        best_fund = max(fund_ids, key=lambda fid: common["by_fund"][fid]["cumulative"])
+        common_text = (
+            f"Over the shared monthly window from {common['period_start']} to {common['period_end']}, "
+            f"{short_name(sheets[best_fund]['fund_name'])} has the stronger cumulative approved return "
+            f"({common['by_fund'][best_fund]['cumulative']}%)."
+        )
+    else:
+        common_text = "There is not enough overlapping approved monthly return history for a clean apples-to-apples performance read."
+
+    summary = (
+        f"{lead} differ most clearly in stated strategy and terms: {strategy_text}. "
+        f"On fund terms, {fee_text}. "
+    )
+    if posture_text:
+        summary += f"On size and positioning, {posture_text}. "
+    summary += common_text
+    return summary
+
+
 def format_comparison(comparison):
     fund_ids = comparison["fund_ids"]
     full = {fid: comparison["sheets"][fid]["fund_name"] for fid in fund_ids}
@@ -168,21 +169,27 @@ def format_comparison(comparison):
     width = max(22, *(len(names[f]) + 2 for f in fund_ids))
 
     legend = "\n".join(f"  {names[f]:<12} {full[f]}" for f in fund_ids)
-    lines = ["", "Funds:", legend, "",
-             " " * 26 + "".join(names[f].ljust(width) for f in fund_ids),
-             "=" * (26 + width * len(fund_ids))]
-    current_section = None
-    for row in comparison["rows"]:
-        if row["section"] != current_section:
-            current_section = row["section"]
-            lines.append(f"\n{SECTION_TITLES[current_section]}")
-        cells = "".join(
-            (str(row["values"][f])[: width - 2] if row["values"][f] is not None else "—").ljust(width)
-            for f in fund_ids
-        )
-        lines.append(f"  {row['label']:<24}{cells}")
+    lines = ["", "Funds:", legend, "", comparison_summary(comparison), ""]
 
     header = f"  {'':<24}" + "".join(names[f][: width - 2].ljust(width) for f in fund_ids)
+
+    for section_name, title in (
+        ("terms", "Terms"),
+        ("metrics", "Reported Metrics"),
+    ):
+        section_rows = [row for row in comparison["rows"] if row["section"] == section_name]
+        if not section_rows:
+            continue
+        lines.append(title)
+        lines.append("-" * len(title))
+        lines.append(header)
+        for row in section_rows:
+            cells = "".join(
+                (str(row["values"][f])[: width - 2] if row["values"][f] is not None else "—").ljust(width)
+                for f in fund_ids
+            )
+            lines.append(f"  {row['label']:<24}{cells}")
+        lines.append("")
 
     # Calendar-year (annual) returns — the headline apples-to-apples comparison.
     cy = comparison["calendar_year"]
@@ -217,28 +224,38 @@ def format_comparison(comparison):
     common = comparison["common_period_statistics"]
     if common["count"] >= 2:
         lines.append(
-            f"\nReturns — COMMON PERIOD ONLY: {common['count']} monthly observations, "
-            f"{common['period_start']} → {common['period_end']} (apples-to-apples, 1dp)"
+            f"\nReturns - COMMON PERIOD ONLY: {common['count']} monthly observations, "
+            f"{common['period_start']} -> {common['period_end']} "
+            f"(apples-to-apples, computed internal; annualized where noted)"
         )
         lines.append(header)
-        labels = {"cumulative": "cumulative return %", "average": "avg monthly %",
-                  "volatility": "volatility %", "sharpe_like": "sharpe-like",
-                  "best": "best month %", "worst": "worst month %"}
+        labels = {"cumulative": "cumulative return %", "average_period_return": "avg monthly %",
+                  "annualized_volatility": "annualized vol %",
+                  "annualized_sharpe": "annualized Sharpe",
+                  "sortino": "Sortino", "best": "best month %", "worst": "worst month %"}
         for stat, label in labels.items():
             cells = "".join(str(common["by_fund"][f].get(stat, "—")).ljust(width) for f in fund_ids)
             lines.append(f"  {label:<24}{cells}")
+        assumption = next(iter(common["by_fund"].values()))
+        lines.append(
+            f"  {'assumptions':<24}"
+            + "".join(
+                f"rf={assumption.get('risk_free_rate', 0.0)}%, p/y={assumption.get('periods_per_year', 12)}".ljust(width)
+                for _ in fund_ids
+            )
+        )
         lines.append(f"\n  Monthly returns over the common period:")
         lines.append(header)
         for row in comparison["overlapping_returns"]:
             cells = "".join(f"{row[f]:.1f}%".ljust(width) for f in fund_ids)
-            lines.append(f"  {row['period_end']:<24}{cells}")
+            lines.append(f"  {row['period']:<24}{cells}")
     else:
         lines.append(
             f"\nReturns: fewer than 2 common monthly observations across these funds, "
             f"so no apples-to-apples comparison. Each fund's own history:"
         )
         lines.append(header)
-        for stat in ("count", "average", "volatility", "best", "worst"):
+        for stat in ("count", "average_period_return", "annualized_volatility", "best", "worst"):
             cells = "".join(
                 str(comparison["own_history_statistics"][f].get(stat, "—")).ljust(width)
                 for f in fund_ids

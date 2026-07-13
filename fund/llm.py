@@ -12,7 +12,8 @@ from fund.db import utc_now
 
 
 def call(connection, *, call_type, model, prompt_input, doc_id=None, fund_id=None,
-         json_output=True, reasoning_effort=REASONING_EFFORT):
+         json_output=True, reasoning_effort=REASONING_EFFORT, tools=None, include=None,
+         max_output_tokens=None, return_response=False):
     """Run one logged LLM call. prompt_input is a string or a responses-API input list.
 
     Returns (call_id, output_text). Raises RuntimeError on failure, after
@@ -39,6 +40,12 @@ def call(connection, *, call_type, model, prompt_input, doc_id=None, fund_id=Non
     kwargs = {"model": model, "input": prompt_input}
     if json_output:
         kwargs["text"] = {"format": {"type": "json_object"}}
+    if tools:
+        kwargs["tools"] = tools
+    if include:
+        kwargs["include"] = include
+    if max_output_tokens:
+        kwargs["max_output_tokens"] = max_output_tokens
     if reasoning_effort and model.startswith("gpt-5"):
         kwargs["reasoning"] = {"effort": reasoning_effort}
 
@@ -63,6 +70,8 @@ def call(connection, *, call_type, model, prompt_input, doc_id=None, fund_id=Non
             ),
         )
         connection.commit()
+        if return_response:
+            return call_id, output_text, response
         return call_id, output_text
     except Exception as exc:
         connection.execute(

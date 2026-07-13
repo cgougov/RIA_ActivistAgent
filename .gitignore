@@ -2,6 +2,9 @@
 __pycache__/
 *.pyc
 .env
+.Rhistory
+fund.egg-info/
 data/db/
+data/factsheets/
 data/page_images/
 exports/

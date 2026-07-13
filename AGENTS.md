@@ -15,22 +15,23 @@ Terminal-first research platform for Japan activist funds. Read README.md for th
 - **One fact table.** All descriptive facts live in `facts`, keyed by the vocabulary in
   `fund/schema.py`. Do not add per-topic fact tables. Returns are the only time-series
   and live in `returns`.
-- **One value per field per fund**, enforced by primary keys. Duplicate prevention happens
-  at write time (extract.py entry gate, review.py upserts) — never as cleanup scripts.
+- **One value per field per fund or per share class**, enforced by primary keys. Duplicate
+  prevention happens at write time (extract.py entry gate, review.py upserts) — never as
+  cleanup scripts.
 - **The factsheet is assembled, not stored.** `factsheet.py` builds it from approved data;
-  snapshots are frozen hashed JSON for analysis reproducibility.
+  snapshots are local, gitignored artifacts with one current file per fund and a
+  `changes` block for refreshes.
 - **Two LLM touchpoints only** (extract, analyze). If it can be computed from stored data,
   compute it. New LLM features must route through `fund/llm.py` so they are logged.
 - **One CLI** (`fund`, in `fund/__main__.py`). New workflows become subcommands, not new
   scripts. No Streamlit or other UI without explicit user request — terminal first.
 - **Add, don't accrete.** Before adding a module/table/abstraction, check whether an
-  existing one covers it. `legacy/` is a frozen reference — never extend it, never import
-  from it.
+  existing one covers it. Do not recreate the removed legacy Streamlit/script tree.
 
 ## Verify changes with
 
 ```bash
-python -m tests.test_pipeline      # no-API pipeline tests
+.venv/bin/python -m tests.test_pipeline      # no-API pipeline tests
 fund status                        # pipeline state sanity check
 fund extract doc_003 --scope profile_terms --dry-run   # preflight still builds
 ```

@@ -1,2 +1,0 @@
-[console_scripts]
-fund = fund.__main__:main

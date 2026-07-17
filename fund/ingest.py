@@ -185,7 +185,7 @@ def register_document(
             fund_id,
             target_path.name,
             original_file_name,
-            str(relative),
+            relative.as_posix(),
             sha256_file(target_path),
             doc_type,
             title,
@@ -197,7 +197,7 @@ def register_document(
     )
     return {
         "doc_id": doc_id,
-        "stored_path": str(relative),
+        "stored_path": relative.as_posix(),
         "is_current": bool(is_current),
         "supersedes_doc_id": supersedes_doc_id,
     }

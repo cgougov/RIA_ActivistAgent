@@ -5,6 +5,9 @@
 Work through these in order. Do not import, classify, or approve a fact merely
 because a filename, folder name, or model output looks plausible.
 
+For the short setup and daily-work instructions, start with
+[INTERN_QUICKSTART.md](INTERN_QUICKSTART.md).
+
 1. **Set up the machine.** Install Git for Windows and Python 3.10+; clone the
    repository; create `.venv`; and run `pip install -e .`. The project is
    terminal-first: it has no web server, browser UI, or service to launch.

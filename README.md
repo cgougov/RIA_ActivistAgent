@@ -174,6 +174,9 @@ data/           pdfs, db, page_images, current factsheet snapshots
 
 ## Practical Guide
 
+For a new intern's shortest setup and monthly-work checklist, see
+[INTERN_QUICKSTART.md](INTERN_QUICKSTART.md).
+
 For the actual day-to-day terminal workflow, see [TERMINAL_WORKFLOW.md](TERMINAL_WORKFLOW.md).
 
 For the shared-drive document lifecycle, see [T_DRIVE_SYSTEM.md](T_DRIVE_SYSTEM.md).

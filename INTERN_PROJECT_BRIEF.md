@@ -1,5 +1,31 @@
 # Japan Activist Funds Research Platform: Intern Brief
 
+## TODO: complete the handoff and research backlog
+
+Work through these in order. Do not import, classify, or approve a fact merely
+because a filename, folder name, or model output looks plausible.
+
+1. **Set up the machine.** Install Git for Windows and Python 3.10+; clone the
+   repository; create `.venv`; and run `pip install -e .`. The project is
+   terminal-first: it has no web server, browser UI, or service to launch.
+2. **Connect the source and approved research state.** Obtain read access to
+   `T:\Research\General`, set
+   `FUND_SOURCE_DOC_ROOT=T:\Research\General\20 Japan-Focused Hedge Funds` in
+   the local `.env`, and receive the current `data\db\fund.db` through the
+   approved internal channel. Never put the database, PDFs, or `.env` in Git.
+3. **Validate before doing research.** Run `fund migrate`, `fund doctor`,
+   `fund crosswalk`, `fund refresh`, and the no-API test suite shown below.
+   `crosswalk` should report the seven reviewed folder mappings as `exact`.
+4. **Finish the bounded universe.** Review the 125 pending sourced fact
+   proposals, register/review the newest factsheet candidates, onboard the
+   remaining priority funds and vetted activist candidates, and build the
+   performance-workbook crosswalk before importing any returns.
+5. **Use live web analysis only after company approval.** The command and
+   bilingual search design are ready and its dry-run works. This managed Codex
+   runtime blocks sending source-derived snapshots to an external web-analysis
+   service; run live web analysis only on a company-approved deployment where
+   that data flow is permitted.
+
 ## Purpose
 
 This project is a lean, terminal-first research system for Japan-focused
@@ -84,6 +110,7 @@ interpret; it cannot silently become the record of truth.
 ### Required on a user or server machine
 
 - Windows PowerShell and Python 3.10 or later.
+- Git for Windows if the machine must clone or receive later project updates.
 - A fresh project virtual environment installed from `pyproject.toml`.
 - Access to the shared T-drive for source PDF refreshes.
 - A local `.env` file containing the permitted OpenAI key and, normally,
@@ -117,21 +144,33 @@ Copy-Item .env.example .env
 
 Then:
 
-1. Add the approved API key and `FUND_SOURCE_DOC_ROOT` to `.env`.
+1. Add the approved API key and
+   `FUND_SOURCE_DOC_ROOT=T:\Research\General\20 Japan-Focused Hedge Funds` to
+   `.env`.
 2. Receive `fund.db` through the secure internal transfer process and place it
    at `data\db\fund.db`.
-3. Confirm the T-drive is mounted and readable.
+3. Confirm the T-drive is mounted and readable:
+
+```powershell
+Test-Path "T:\Research\General\20 Japan-Focused Hedge Funds"
+Test-Path "T:\Research\General\90 Manager Perf Database\Global 10-10-5 HF"
+```
+
+Both commands must return `True`. If not, ask IT to map the T-drive and grant
+read access to `T:\Research\General`; no special write permission is needed.
 4. Run:
 
 ```powershell
 fund migrate
 fund doctor
+fund crosswalk
 fund refresh --root "T:\Research\General\20 Japan-Focused Hedge Funds"
 .\.venv\Scripts\python.exe -m tests.test_pipeline
 ```
 
-`fund doctor` should show the current schema. `fund refresh` should show the
-mapped folders. The tests should pass without an API call.
+`fund doctor` should show the current schema. `fund crosswalk` should show the
+seven reviewed mappings as `exact`; `fund refresh` should show the mapped
+folders. The tests should pass without an API call.
 
 For detail, use [T_DRIVE_SYSTEM.md](T_DRIVE_SYSTEM.md) and
 [TERMINAL_WORKFLOW.md](TERMINAL_WORKFLOW.md).

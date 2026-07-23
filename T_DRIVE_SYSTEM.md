@@ -25,7 +25,7 @@ returns. It never modifies a T-drive PDF.
 Set this in `.env` once:
 
 ```dotenv
-FUND_SOURCE_DOC_ROOT=T:\Research\General
+FUND_SOURCE_DOC_ROOT=T:\Research\General\20 Japan-Focused Hedge Funds
 ```
 
 Any PDF registered from below that root is external by default: it stays on the

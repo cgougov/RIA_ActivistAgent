@@ -20,7 +20,7 @@
   fund compare NAME NAME [...]   deterministic side-by-side, common period only
   fund export NAME               Markdown factsheet export
   fund analyze --funds a,b -q Q  LLM analysis on approved truth
-  fund analyze-activism --funds a,b  web-backed stated-vs-observed activism check
+  fund analyze-activism --funds a,b  policy-dependent public activism check
   fund analyses / show / log     saved analyses and the LLM call log
 
 Funds can be named by a handle (simplex, begonia) instead of fund_002.
@@ -41,8 +41,9 @@ from fund import ingest as ingest_mod
 from fund import review as review_mod
 from fund import screen as screen_mod
 from fund import similarity as similarity_mod
+from fund import universe as universe_mod
 from fund import verification as verification_mod
-from fund.config import DB_PATH, PAGE_IMAGE_DIR, PDF_DIR
+from fund.config import DB_PATH, PAGE_IMAGE_DIR, PDF_DIR, SOURCE_DOC_ROOT
 from fund.db import (
     CURRENT_SCHEMA_VERSION,
     backup_database,
@@ -55,14 +56,18 @@ from fund.db import (
 
 def resolve_fund(conn, token):
     """Turn a user token into a fund_id. Accepts the exact id ('fund_002') or a
-    case-insensitive substring of the fund or manager name ('simplex')."""
+    case-insensitive substring of the fund, manager, or reviewed alias."""
     exact = conn.execute("SELECT fund_id FROM funds WHERE fund_id = ?", (token,)).fetchone()
     if exact:
         return exact["fund_id"]
     like = f"%{token}%"
     matches = conn.execute(
-        "SELECT fund_id, fund_name FROM funds WHERE fund_name LIKE ? OR manager_name LIKE ? "
-        "ORDER BY fund_id", (like, like),
+        """
+        SELECT DISTINCT f.fund_id, f.fund_name
+        FROM funds f LEFT JOIN fund_aliases a ON a.fund_id = f.fund_id
+        WHERE f.fund_name LIKE ? OR f.manager_name LIKE ? OR a.alias LIKE ?
+        ORDER BY f.fund_id
+        """, (like, like, like),
     ).fetchall()
     if not matches:
         raise ValueError(f"No fund matches '{token}'. Try: fund list")
@@ -200,7 +205,9 @@ def format_next(next_item):
 def cmd_init(args):
     with connect(verify=False) as conn:
         table_count = conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            """SELECT COUNT(*) FROM sqlite_master
+               WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 AND name NOT GLOB 'page_search_*'"""
         ).fetchone()[0]
         version = current_schema_version(conn)
         if table_count == 0:
@@ -245,7 +252,7 @@ def cmd_status(args):
         counts = {
             table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in ("funds", "documents", "pages", "proposals", "proposed_returns",
-                          "facts", "returns", "llm_calls", "analyses", "snapshot_embeddings")
+                          "facts", "returns", "llm_calls", "analyses")
         }
         pending = conn.execute("SELECT COUNT(*) FROM proposals WHERE status='pending'").fetchone()[0]
         pending_ret = conn.execute("SELECT COUNT(*) FROM proposed_returns WHERE status='pending'").fetchone()[0]
@@ -349,7 +356,7 @@ def cmd_doctor(args):
     print("------")
     print(f"DB path: {DB_PATH}")
     print(f"Schema: {version or 'not initialized'} / current {CURRENT_SCHEMA_VERSION}")
-    print(f"Tables: {table_count}")
+    print(f"SQLite tables: {table_count} (includes local search-index internals when present)")
     print(f"Python: {sys.executable}")
     print(f"Package: fund {package_version}")
     print(f"OPENAI_API_KEY: {'set' if os.getenv('OPENAI_API_KEY') else 'missing'}")
@@ -395,13 +402,148 @@ def cmd_add_doc(args):
             args.date,
             Path(args.path),
             title=args.title,
+            external=args.external,
         )
     print(f"Added {result['doc_type']} for {fund_id}: {result['doc_id']}")
-    print(f"  stored: {result['stored_path']}")
+    print(f"  source ({result['source_kind']}): {result['source_path']}")
     print(f"  pages: {result['pages']}")
     if result["supersedes_doc_id"]:
         print(f"  current lineage: supersedes {result['supersedes_doc_id']}")
     print(f"Next: fund onboard {args.fund} --dry-run")
+
+
+def cmd_discover_docs(args):
+    root = args.root or SOURCE_DOC_ROOT
+    if not root:
+        raise ValueError("Pass --root PATH or set FUND_SOURCE_DOC_ROOT.")
+    with connect() as conn:
+        rows = ingest_mod.discover_source_documents(conn, root)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    print(f"Discovered {len(rows)} PDFs under {root} (read-only; no files or DB rows changed).")
+    for row in rows:
+        duplicate = ", ".join(row["duplicate_doc_ids"]) or "new"
+        inferred = f"{row['inferred_type']}, {row['inferred_date'] or 'date unknown'}"
+        print(f"  [{duplicate}] {inferred:<28} {row['path']}")
+
+
+def cmd_alias(args):
+    with connect() as conn:
+        fund_id = resolve_fund(conn, args.fund) if args.fund else None
+        if args.alias:
+            if not fund_id:
+                raise ValueError("Pass --fund when adding an alias.")
+            ingest_mod.register_alias(conn, fund_id, args.alias)
+            print(f"Alias added: {args.alias} -> {fund_id}")
+            return
+        rows = ingest_mod.list_aliases(conn, fund_id=fund_id)
+    if not rows:
+        print("No reviewed aliases.")
+        return
+    for row in rows:
+        print(f"{row['fund_id']:<12} {row['alias']:<42} {row['alias_type']}")
+
+
+def cmd_crosswalk(args):
+    root = args.root or SOURCE_DOC_ROOT
+    if not root:
+        raise ValueError("Pass --root PATH or set FUND_SOURCE_DOC_ROOT.")
+    with connect() as conn:
+        rows = ingest_mod.crosswalk_folders(conn, root)
+    if not args.all:
+        rows = [row for row in rows if row["status"] != "unmatched"]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    print(f"Folder crosswalk under {root} (read-only; review likely matches before using them).")
+    if not args.all:
+        print("  Showing matched/ambiguous folders only; use --all for the full source tree.")
+    for row in rows:
+        targets = ", ".join(row["fund_ids"]) or "-"
+        terms = ", ".join(row["matched_terms"]) or "-"
+        print(f"  {row['status']:<10} {row['folder']:<42} -> {targets} [{terms}]")
+
+
+def cmd_refresh(args):
+    root = args.root or SOURCE_DOC_ROOT
+    if not root:
+        raise ValueError("Pass --root PATH or set FUND_SOURCE_DOC_ROOT.")
+    with connect() as conn:
+        rows = ingest_mod.refresh_preflight(conn, root, include_unmatched=args.all)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    print(f"Refresh preflight under {root} (read-only; no files, database rows, or API calls changed).")
+    if not args.all:
+        print("  Showing matched/ambiguous folders only; use --all for the full source tree.")
+    for row in rows:
+        newest = row.get("newest_factsheet") or {}
+        document = newest.get("path") or "-"
+        date = newest.get("inferred_date") or "date unknown"
+        print(f"  {row['status']:<10} {row['folder']:<38} PDFs={row['pdf_count']:<3} "
+              f"newest={date:<12} {row['next_action']}")
+        if document != "-":
+            print(f"    {document}")
+
+
+def cmd_search(args):
+    with connect() as conn:
+        fund_id = resolve_fund(conn, args.fund) if args.fund else None
+        rows = ingest_mod.search_source_pages(
+            conn, args.query, fund_id=fund_id, doc_id=args.doc, limit=args.limit,
+        )
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        print(f"No source-page matches for: {args.query!r}")
+        return
+    print(f"Local evidence matches for: {args.query!r} (keyword retrieval, not a model answer)")
+    print("Use the document/page and excerpt below to inspect the original source.")
+    for row in rows:
+        date = row["doc_date"] or "undated"
+        print(f"\n[{row['fund_id']} {row['doc_id']} p.{row['page_number']} | {row['title']} | {row['doc_type']} {date}]")
+        print(f"  {row['excerpt']}")
+        print(f"  {row['source_path']}")
+
+
+def cmd_classify(args):
+    if not args.activity and not args.activist:
+        raise ValueError("Pass --activity and/or --activist.")
+    with connect() as conn:
+        fund_id = resolve_fund(conn, args.fund)
+        results = []
+        for field_key, value in (
+            ("activity_status", args.activity),
+            ("activist_universe_status", args.activist),
+        ):
+            if value:
+                evidence = review_mod.approve_sourced_fact(
+                    conn, fund_id=fund_id, field_key=field_key, value=value,
+                    doc_id=args.doc, page=args.page, quote=args.quote,
+                    reviewer=args.reviewer, as_of_date=args.as_of,
+                )
+                results.append((field_key, value, evidence["quote_verify_status"]))
+    for field_key, value, verification in results:
+        print(f"Approved {field_key}: {value} ({verification})")
+
+
+def cmd_universe(args):
+    with connect() as conn:
+        rows = universe_mod.classifications(conn)
+    print("Activist universe")
+    print("-----------------")
+    print(f"  {'fund_id':<12} {'universe':<20} {'activity':<12} evidence")
+    for row in rows:
+        universe = row["activist_universe_status"] or "unclassified"
+        activity = row["activity_status"] or "unclassified"
+        evidence = []
+        if row["universe_doc_id"]:
+            evidence.append(f"universe {row['universe_doc_id']} p.{row['universe_page']}")
+        if row["activity_doc_id"]:
+            evidence.append(f"activity {row['activity_doc_id']} p.{row['activity_page']}")
+        print(f"  {row['fund_id']:<12} {universe:<20} {activity:<12} {'; '.join(evidence) or '-'}")
 
 
 def cmd_verify(args):
@@ -764,6 +906,9 @@ def cmd_screen(args):
             min_history_years=args.min_history,
             sort_field=sort_field,
             descending=descending,
+            activist_only=args.activist_only,
+            include_uncertain=args.include_uncertain,
+            include_candidates=args.include_candidates,
         )
     print(screen_mod.format_screen(result))
 
@@ -771,13 +916,21 @@ def cmd_screen(args):
 def cmd_similar(args):
     with connect() as conn:
         if args.all:
-            result = similarity_mod.all_pairwise_similarity(conn)
+            result = similarity_mod.all_pairwise_similarity(
+                conn, activist_only=args.activist_only,
+                include_uncertain=args.include_uncertain,
+                include_candidates=args.include_candidates,
+            )
             print(similarity_mod.format_pairwise(result, limit=args.limit))
             return
         if not args.fund:
             raise ValueError("Usage: fund similar FUND or fund similar --all")
         fund_id = resolve_fund(conn, args.fund)
-        result = similarity_mod.similar_funds(conn, fund_id, limit=args.limit)
+        result = similarity_mod.similar_funds(
+            conn, fund_id, limit=args.limit, activist_only=args.activist_only,
+            include_uncertain=args.include_uncertain,
+            include_candidates=args.include_candidates,
+        )
     print(similarity_mod.format_similar(result))
 
 
@@ -786,19 +939,19 @@ def cmd_compare(args):
     with connect() as conn:
         fund_ids = [resolve_fund(conn, token) for token in args.funds]
         comparison = compare_mod.compare_funds(conn, fund_ids, field_keys=fields)
-        similarity = None
-        if args.embedding_similarity:
-            similarity = analyze_mod.factsheet_embedding_similarity(conn, fund_ids, dry_run=args.dry_run)
+        web_result = None
+        if args.web_reality_check:
+            web_result = analyze_mod.run_activism_reality_analysis(
+                conn, fund_ids, dry_run=args.dry_run,
+            )
     print(compare_mod.format_comparison(comparison))
-    if args.embedding_similarity:
+    if web_result is not None:
         if args.dry_run:
-            print("\nEmbedding similarity dry-run:")
-            print(json.dumps(similarity, indent=2))
+            print("\nWeb reality-check preflight (no API call):")
+            print(json.dumps(web_result, indent=2, ensure_ascii=False))
         else:
-            print("\nFactsheet embedding similarity:")
-            print(f"  model: {similarity['model']}")
-            for pair in similarity["pairs"]:
-                print(f"  {pair['left']} vs {pair['right']}: {pair['cosine_similarity']}")
+            print("\nPublic-web activism reality check:")
+            print(web_result["output_text"])
 
 
 def cmd_export(args):
@@ -872,6 +1025,10 @@ def cmd_log(args):
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
     parser = argparse.ArgumentParser(prog="fund", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -891,13 +1048,62 @@ def main():
     sub.add_parser("doctor", help="environment and database sanity check").set_defaults(func=cmd_doctor)
     sub.add_parser("ingest").set_defaults(func=cmd_ingest)
 
-    p = sub.add_parser("add-doc", help="register a new current factsheet or presentation")
+    p = sub.add_parser("add-doc", help="register a factsheet, presentation, or supporting evidence PDF")
     p.add_argument("--fund", required=True, help="fund name (e.g. simplex) or id")
-    p.add_argument("--type", required=True, choices=("factsheet", "presentation"))
+    p.add_argument("--type", required=True, choices=("factsheet", "presentation", "evidence"))
     p.add_argument("--date", required=True, help="document date as YYYY-MM-DD when known")
     p.add_argument("--title", help="optional document title override")
+    source_mode = p.add_mutually_exclusive_group()
+    source_mode.add_argument("--external", dest="external", action="store_const", const=True,
+                             help="keep the PDF at its source path")
+    source_mode.add_argument("--copy", dest="external", action="store_const", const=False,
+                             help="copy the PDF into project storage (overrides source-root default)")
+    p.set_defaults(external=None)
     p.add_argument("path", help="path to the PDF to register")
     p.set_defaults(func=cmd_add_doc)
+
+    p = sub.add_parser("discover-docs", help="inventory external PDFs and detect known hashes (read-only)")
+    p.add_argument("--root", help="source root; defaults to FUND_SOURCE_DOC_ROOT")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_discover_docs)
+
+    p = sub.add_parser("alias", help="add or list reviewed fund aliases for T-drive matching")
+    p.add_argument("alias", nargs="?", help="alias to add")
+    p.add_argument("--fund", help="fund name or id; required when adding an alias")
+    p.set_defaults(func=cmd_alias)
+
+    p = sub.add_parser("crosswalk", help="map immediate source folders to reviewed fund identities (read-only)")
+    p.add_argument("--root", help="source root; defaults to FUND_SOURCE_DOC_ROOT")
+    p.add_argument("--all", action="store_true", help="include unmatched folders")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_crosswalk)
+
+    p = sub.add_parser("refresh", help="one read-only source refresh preflight")
+    p.add_argument("--root", help="source root; defaults to FUND_SOURCE_DOC_ROOT")
+    p.add_argument("--all", action="store_true", help="include unmatched folders")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_refresh)
+
+    p = sub.add_parser("search", help="search extracted source pages locally with document/page citations")
+    p.add_argument("query")
+    p.add_argument("--fund", help="limit to one fund name or id")
+    p.add_argument("--doc", help="limit to one document id")
+    p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("classify", help="approve sourced activist/activity status facts")
+    p.add_argument("fund", help="fund name or id")
+    p.add_argument("--activity", choices=("active", "uncertain", "inactive"))
+    p.add_argument("--activist", choices=("candidate", "verified_activist", "excluded"))
+    p.add_argument("--doc", required=True, help="source document id")
+    p.add_argument("--page", required=True, type=int, help="source page")
+    p.add_argument("--quote", required=True, help="supporting quote from that page")
+    p.add_argument("--as-of", help="optional YYYY-MM-DD status date; defaults to source document date")
+    p.add_argument("--reviewer", default="christian")
+    p.set_defaults(func=cmd_classify)
+
+    sub.add_parser("universe", help="show reviewed activist/activity classifications").set_defaults(func=cmd_universe)
 
     p = sub.add_parser("verify", help="backfill quote verification for staged proposals/returns")
     p.add_argument("--doc", help="limit to one document id")
@@ -988,21 +1194,33 @@ def main():
                    help="numeric filter, e.g. management_fee<1.5 or annualized_sharpe>=1")
     p.add_argument("--min-history", type=float, help="minimum monthly return history in years")
     p.add_argument("--sort", help='sort expression, e.g. "annualized_sharpe desc"')
+    p.add_argument("--activist-only", action="store_true",
+                   help="include only verified activists with active status")
+    p.add_argument("--include-uncertain", action="store_true",
+                   help="with --activist-only, include uncertain activity status")
+    p.add_argument("--include-candidates", action="store_true",
+                   help="with --activist-only, include candidate activist funds")
     p.set_defaults(func=cmd_screen)
 
     p = sub.add_parser("similar", help="rank qualitative similarity using approved facts")
     p.add_argument("fund", nargs="?", help="fund name (e.g. simplex) or id")
     p.add_argument("--all", action="store_true", help="rank all fund pairs")
     p.add_argument("--limit", type=int, default=10)
+    p.add_argument("--activist-only", action="store_true",
+                   help="include only verified activists with active status")
+    p.add_argument("--include-uncertain", action="store_true",
+                   help="with --activist-only, include uncertain activity status")
+    p.add_argument("--include-candidates", action="store_true",
+                   help="with --activist-only, include candidate activist funds")
     p.set_defaults(func=cmd_similar)
 
     p = sub.add_parser("compare")
     p.add_argument("funds", nargs="+", help="fund names (e.g. simplex begonia) or ids")
     p.add_argument("--fields")
-    p.add_argument("--embedding-similarity", action="store_true",
-                   help="also compare factsheet snapshot embeddings")
+    p.add_argument("--web-reality-check", action="store_true",
+                   help="also run the policy-dependent bilingual public-web activism check")
     p.add_argument("--dry-run", action="store_true",
-                   help="for embedding similarity only, show payload sizes without an API call")
+                   help="with --web-reality-check, show planned bilingual queries without an API call")
     p.set_defaults(func=cmd_compare)
 
     p = sub.add_parser("export", help="export approved factsheet or comparison as Markdown")

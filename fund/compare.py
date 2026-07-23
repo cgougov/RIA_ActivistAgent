@@ -13,6 +13,7 @@ from fund.analytics import (
 )
 from fund.factsheet import build_factsheet
 from fund.schema import FIELDS, SECTION_ORDER, SECTION_TITLES, section_fields
+from fund.universe import classifications
 
 
 def compare_funds(connection, fund_ids, field_keys=None):
@@ -39,6 +40,7 @@ def compare_funds(connection, fund_ids, field_keys=None):
     overlap = overlapping_returns(sheets)
     common_stats = common_period_statistics(overlap, fund_ids)
     return {"fund_ids": list(fund_ids), "sheets": sheets, "rows": rows,
+            "classifications": {row["fund_id"]: row for row in classifications(connection, fund_ids)},
             "overlapping_returns": overlap, "common_period_statistics": common_stats,
             "calendar_year": calendar_year_comparison(sheets, fund_ids),
             "own_history_statistics": {fid: sheets[fid]["return_statistics"] for fid in fund_ids}}
@@ -171,6 +173,17 @@ def format_comparison(comparison):
     legend = "\n".join(f"  {names[f]:<12} {full[f]}" for f in fund_ids)
     lines = ["", "Funds:", legend, "", comparison_summary(comparison), ""]
 
+    classifications = comparison.get("classifications") or {}
+    lines.extend(["Universe status", "---------------"])
+    for fund_id in fund_ids:
+        row = classifications.get(fund_id, {})
+        lines.append(
+            f"  {names[fund_id]:<12} "
+            f"{row.get('activist_universe_status') or 'unclassified'}; "
+            f"{row.get('activity_status') or 'unclassified'}"
+        )
+    lines.append("")
+
     header = f"  {'':<24}" + "".join(names[f][: width - 2].ljust(width) for f in fund_ids)
 
     for section_name, title in (
@@ -249,6 +262,16 @@ def format_comparison(comparison):
         for row in comparison["overlapping_returns"]:
             cells = "".join(f"{row[f]:.1f}%".ljust(width) for f in fund_ids)
             lines.append(f"  {row['period']:<24}{cells}")
+        correlations = common.get("correlations") or []
+        if correlations:
+            lines.append("\n  Return correlation (Pearson, same monthly window; computed internal):")
+            for row in correlations:
+                label = f"{names[row['left']]} vs {names[row['right']]}"
+                if row["correlation"] is None:
+                    value = f"unavailable (<6 observations; n={row['observations']})"
+                else:
+                    value = f"{row['correlation']:+.2f} (n={row['observations']})"
+                lines.append(f"  {label:<24}{value}")
     else:
         lines.append(
             f"\nReturns: fewer than 2 common monthly observations across these funds, "

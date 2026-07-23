@@ -1,6 +1,6 @@
 """No-API pipeline tests against an in-memory database.
 
-Run: .venv/bin/python -m tests.test_pipeline
+Run: .\\.venv\\Scripts\\python.exe -m tests.test_pipeline
 Covers the correctness core: staging dedup, approval upsert (structural
 one-value-per-field), return quality upsert, factsheet assembly, comparison.
 """
@@ -16,8 +16,9 @@ from fund.analyze import (
     activism_analysis_context,
     build_activism_reality_prompt,
     build_public_examples_prompt,
-    factsheet_embedding_similarity,
     format_activism_reality_result,
+    public_query_examples,
+    run_analysis,
 )
 from fund.db import SCHEMA, connect, create_schema, migrate_to_latest, utc_now
 from fund.extract import _dedup_against_db, _save_return_rows, save_proposals
@@ -32,10 +33,11 @@ from fund.factsheet import (
 from fund.export import markdown_compare, markdown_factsheet, peer_context
 import fund.factsheet as factsheet_mod
 import fund.ingest as ingest_mod
-from fund.review import (approve_proposal, approve_return_row, pending_proposals,
+from fund.review import (approve_proposal, approve_return_row, approve_sourced_fact, pending_proposals,
                          reject_proposal, reopen_proposal)
 from fund.screen import format_screen, screen_funds
 from fund.similarity import format_similar, similar_funds
+from fund.universe import classifications, is_eligible
 from fund.verification import reconcile_returns, verify_existing
 from fund.__main__ import format_inbox, format_next, workflow_inbox, workflow_next
 
@@ -412,6 +414,8 @@ def test_common_period_comparison():
     # f1 over the common period: mean(2,3)=2.5 ; f2: mean(0,4)=2.0
     assert common["by_fund"]["f1"]["average"] == 2.5
     assert common["by_fund"]["f2"]["average"] == 2.0
+    assert common["correlations"][0]["correlation"] is None
+    assert common["correlations"][0]["observations"] == 2
     assert "sharpe_like" not in common["by_fund"]["f1"]
     assert "annualized_sharpe" in common["by_fund"]["f1"]
     print("common-period comparison: OK")
@@ -530,6 +534,8 @@ def test_connect_requires_explicit_migration():
             assert "share_class" in proposal_cols
             assert "share_class" in fact_cols
             assert "stored_path" in doc_cols
+            assert "source_kind" in doc_cols
+            assert "source_path" in doc_cols
             assert "is_current" in doc_cols
             proposal = migrated.execute("SELECT share_class FROM proposals WHERE proposal_id = 'p1'").fetchone()
             fact = migrated.execute(
@@ -668,6 +674,20 @@ def test_snapshot_replaces_old_file_and_records_changes():
     print("snapshot replace + change log: OK")
 
 
+def test_analysis_dry_run_does_not_write_snapshot():
+    conn = make_db()
+    with tempfile.TemporaryDirectory() as tmp:
+        original_dir = factsheet_mod.FACTSHEET_DIR
+        factsheet_mod.FACTSHEET_DIR = Path(tmp)
+        try:
+            result = run_analysis(conn, ["f1"], "Summarize the available evidence.", dry_run=True)
+            assert result["dry_run"] is True
+            assert not list(Path(tmp).iterdir())
+        finally:
+            factsheet_mod.FACTSHEET_DIR = original_dir
+    print("analysis dry-run is side-effect free: OK")
+
+
 def test_compare_uses_year_end_ytd_before_monthly_rollup():
     from fund.compare import calendar_year_comparison
     conn = make_db()
@@ -710,6 +730,7 @@ def test_activism_prompt_and_render():
     assert "use web search" in search_prompt.lower()
     assert "english and japanese" in search_prompt.lower()
     assert "translate japanese findings into english" in search_prompt.lower()
+    assert any("株主提案" in query for query in public_query_examples(context))
     prompt = build_activism_reality_prompt([context], ["FUND: Alpha Fund (f1)\nWEB FINDINGS:\n- unknown | none | none | none"])
     assert "web findings" in prompt.lower()
     rendered = format_activism_reality_result(
@@ -759,22 +780,45 @@ def test_qualitative_similarity():
     assert result["rows"][0]["score"] > 0.5
     rendered = format_similar(result)
     assert "Similar funds to Alpha Fund" in rendered
+    assert "Context:" in rendered and "Peer-by-peer difference" in rendered
     assert "excludes terms and return history" in rendered
     print("qualitative similarity: OK")
 
 
-def test_embedding_similarity_dry_run():
+def test_local_source_search_alias_crosswalk_and_classification():
     conn = make_db()
-    stage(conn, key="management_fee", value="1.5")
-    stage(conn, doc="d3", fund="f2", key="management_fee", value="2.0")
-    for prop in pending_proposals(conn, fund_id="f1"):
-        approve_proposal(conn, prop["proposal_id"], "tester")
-    for prop in pending_proposals(conn, fund_id="f2"):
-        approve_proposal(conn, prop["proposal_id"], "tester")
-    result = factsheet_embedding_similarity(conn, ["f1", "f2"], dry_run=True)
-    assert result["dry_run"] is True
-    assert len(result["chars"]) == 2
-    print("embedding similarity dry-run: OK")
+    page_text = "Alpha uses constructive governance engagement with Japanese companies."
+    conn.execute("INSERT INTO pages (doc_id, page_number, text) VALUES ('d1', 1, ?)", (page_text,))
+    conn.execute(
+        "INSERT INTO page_search (doc_id, fund_id, page_number, text) VALUES ('d1', 'f1', 1, ?)",
+        (page_text,),
+    )
+    rows = ingest_mod.search_source_pages(conn, "constructive governance", fund_id="f1")
+    assert len(rows) == 1 and rows[0]["doc_id"] == "d1" and rows[0]["page_number"] == 1
+    assert ingest_mod.infer_document_date(Path("Alpha December 2024 Performance.pdf")) == "2024-12-31"
+
+    ingest_mod.register_alias(conn, "f1", "Alpha T-Drive Folder")
+    assert ingest_mod.list_aliases(conn, "f1")[0]["alias"] == "Alpha T-Drive Folder"
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "Alpha T-Drive Folder").mkdir()
+        mapping = ingest_mod.crosswalk_folders(conn, root)
+    assert mapping[0]["status"] == "exact" and mapping[0]["fund_ids"] == ["f1"]
+
+    evidence = approve_sourced_fact(
+        conn, fund_id="f1", field_key="activity_status", value="active", doc_id="d1",
+        page=1, quote="constructive governance engagement", reviewer="tester",
+    )
+    assert evidence["quote_verified"] == 1
+    approve_sourced_fact(
+        conn, fund_id="f1", field_key="activist_universe_status", value="verified_activist",
+        doc_id="d1", page=1, quote="constructive governance engagement", reviewer="tester",
+    )
+    classification = next(row for row in classifications(conn) if row["fund_id"] == "f1")
+    assert is_eligible(classification)
+    screened = screen_funds(conn, activist_only=True)
+    assert [row["fund_id"] for row in screened["rows"]] == ["f1"]
+    print("local source search + aliases + activist classification: OK")
 
 
 def test_return_page_detection_and_routing():
@@ -995,6 +1039,41 @@ def test_register_document_tracks_current_lineage():
     print("document current lineage + normalized storage: OK")
 
 
+def test_external_document_stays_at_source_and_discovery_detects_hash():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_root = root / "source"
+        source_root.mkdir()
+        source = source_root / "Alpha Monthly Factsheet 2026-06.pdf"
+        pdf = fitz.open()
+        pdf.new_page().insert_text((72, 72), "Alpha factsheet")
+        pdf.save(source)
+        pdf.close()
+        conn = make_db()
+        original_source_root = ingest_mod.SOURCE_DOC_ROOT
+        ingest_mod.SOURCE_DOC_ROOT = str(source_root)
+        try:
+            assert ingest_mod.should_keep_external(source) is True
+            registered = ingest_mod.add_document(
+                conn, "f1", "factsheet", "2026-06-30", source, external=None,
+            )
+        finally:
+            ingest_mod.SOURCE_DOC_ROOT = original_source_root
+        doc = dict(conn.execute(
+            "SELECT * FROM documents WHERE doc_id = ?", (registered["doc_id"],)
+        ).fetchone())
+        assert doc["source_kind"] == "external_file"
+        assert doc["source_path"] == str(source.resolve())
+        assert ingest_mod.document_pdf_path(doc) == source.resolve()
+        assert not list((root / "data").rglob("*.pdf")) if (root / "data").exists() else True
+        assert registered["pages"] == 1
+        discovered = ingest_mod.discover_source_documents(conn, source_root)
+        assert discovered[0]["duplicate_doc_ids"] == [registered["doc_id"]]
+        assert discovered[0]["inferred_type"] == "factsheet"
+        assert discovered[0]["inferred_date"] == "2026-06-30"
+    print("external document source + discovery: OK")
+
+
 if __name__ == "__main__":
     test_staging_and_dedup()
     test_approval_is_structurally_deduped()
@@ -1021,12 +1100,14 @@ if __name__ == "__main__":
     test_factsheet_uses_year_end_ytd_as_annual()
     test_factsheet_computes_annual_from_monthly_when_needed()
     test_snapshot_replaces_old_file_and_records_changes()
+    test_analysis_dry_run_does_not_write_snapshot()
     test_compare_uses_year_end_ytd_before_monthly_rollup()
     test_activism_prompt_and_render()
     test_qualitative_similarity()
-    test_embedding_similarity_dry_run()
+    test_local_source_search_alias_crosswalk_and_classification()
     test_connect_requires_explicit_migration()
     test_register_document_tracks_current_lineage()
+    test_external_document_stays_at_source_and_discovery_detects_hash()
     test_return_page_detection_and_routing()
     test_most_recent_source_wins()
     test_factsheet_source_beats_presentation()

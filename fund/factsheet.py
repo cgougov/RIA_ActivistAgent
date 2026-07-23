@@ -7,6 +7,9 @@ so an analysis can be tied to the exact data it saw.
 """
 import hashlib
 import json
+import os
+import tempfile
+from pathlib import Path
 
 from fund.analytics import (
     annual_display_series,
@@ -120,19 +123,43 @@ def snapshot_factsheet(connection, fund_id):
     previous file, so the folder stays lean without losing the "what changed"
     signal during refreshes.
     """
-    sheet = build_factsheet(connection, fund_id)
+    sheet, digest = factsheet_payload(connection, fund_id)
     previous = _latest_snapshot(fund_id)
     previous_sheet = _read_snapshot(previous) if previous else None
-    canonical = json.dumps(sheet, sort_keys=True, ensure_ascii=False)
-    digest = hashlib.sha256(canonical.encode()).hexdigest()[:12]
     FACTSHEET_DIR.mkdir(parents=True, exist_ok=True)
     path = FACTSHEET_DIR / f"{fund_id}_{digest}.json"
     if not path.exists():
         sheet["changes"] = _snapshot_changes(previous_sheet, sheet)
         sheet["snapshot"] = {"hash": digest, "created_at": utc_now()}
-        path.write_text(json.dumps(sheet, indent=2, ensure_ascii=False))
+        _atomic_write_json(path, sheet)
     _remove_stale_snapshots(fund_id, keep_path=path)
     return path, digest
+
+
+def factsheet_payload(connection, fund_id):
+    """Build the exact snapshot payload and hash without writing an artifact."""
+    sheet = build_factsheet(connection, fund_id)
+    canonical = json.dumps(sheet, sort_keys=True, ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12]
+    return sheet, digest
+
+
+def _atomic_write_json(path, payload):
+    """Write UTF-8 JSON atomically so a failed write cannot leave an empty snapshot."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.stem}.",
+        suffix=".tmp", delete=False,
+    ) as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = handle.name
+    try:
+        Path(temporary).replace(path)
+    finally:
+        leftover = Path(temporary)
+        if leftover.exists():
+            leftover.unlink()
 
 
 def _latest_snapshot(fund_id):
@@ -148,8 +175,8 @@ def _latest_snapshot(fund_id):
 
 def _read_snapshot(path):
     try:
-        return json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 

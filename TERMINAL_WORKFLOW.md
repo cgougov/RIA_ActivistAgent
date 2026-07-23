@@ -1,38 +1,40 @@
 # Terminal Workflow
 
-This repo is meant to be used from the terminal first.
+This is the Windows, terminal-first operating guide for the Japan activist-fund
+research platform. The product is intentionally small: maintain a reliable
+activist universe, retain document-level evidence, approve facts, then compare
+only approved information.
 
-The active pipeline is:
+## The operating model
 
-`PDFs -> proposed facts / proposed return rows -> human approval -> approved factsheet -> comparison -> analysis`
-
-The schema is now explicit:
-
-- normal commands read the current schema
-- `fund migrate` is the only command that should change schema structure
-- new factsheets/presentations should come in through `fund add-doc`
-
-## Start Here
-
-From the repo root:
-
-macOS / Linux:
-
-```bash
-source .venv/bin/activate
-unset FUND_DB_PATH
-export FUND_DB_PATH="$PWD/data/db/fund.db"
+```text
+T-drive source PDF (stays on T:) -> page text + metadata -> proposed facts
+-> evidence check -> approval -> factsheet / screen / compare
 ```
 
-Windows PowerShell:
+The SQLite database is the approved record. PDFs are not copied from the
+configured T-drive source root; the database holds their source paths, hashes,
+metadata, page text, and approved evidence. A fact is usable only when it has a
+document, page, and supporting quote.
+
+No generic RAG or vector database is needed for the normal workflow. The
+database already provides the useful retrieval boundary: exact fund, field,
+document, page, quote, and approved status. Use `fund factsheet --sources` or
+`fund export` whenever you need to inspect the evidence behind an output.
+
+## Start a session
+
+From the repository root:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-Remove-Item Env:FUND_DB_PATH -ErrorAction SilentlyContinue
 $env:FUND_DB_PATH = (Resolve-Path .\data\db\fund.db)
+fund doctor
+fund status
+fund next
 ```
 
-If this is a fresh Windows VM checkout:
+For a new Windows machine:
 
 ```powershell
 py -m venv .venv
@@ -41,398 +43,253 @@ pip install -e .
 Copy-Item .env.example .env
 ```
 
-Do not copy the macOS `.venv/` folder into the Windows VM. Rebuild it on the VM.
-Also treat `.env` deliberately: Git will not transfer it, and folder-copying it
-would silently move the API key.
+Add the OpenAI key and T-drive root deliberately to `.env`:
 
-Sanity check:
-
-```bash
-which fund
-python3 -c "from fund.config import DB_PATH; print(DB_PATH)"
-fund doctor
+```dotenv
+OPENAI_API_KEY=...
+FUND_SOURCE_DOC_ROOT=T:\Research\General
 ```
 
-Windows PowerShell equivalent:
+`.env`, the live database, page-image cache, and generated snapshots are not
+versioned. Rebuild `.venv` on each machine; never copy it between machines.
+
+If the command is unavailable, use the virtual-environment executable directly:
 
 ```powershell
-Get-Command fund
-py -c "from fund.config import DB_PATH; print(DB_PATH)"
-fund doctor
+.\.venv\Scripts\fund.exe status
 ```
 
-If `which fund` is blank or points somewhere unexpected, use the explicit venv
-command. On macOS / Linux:
+Run `fund migrate` only when `fund doctor` or a release note explicitly asks
+for it. Migration changes schema metadata; it is not a daily command.
 
-```bash
-.venv/bin/fund status
-.venv/bin/fund migrate
-```
+## Daily workflow
 
-On Windows PowerShell:
+### 1. See what needs attention
 
 ```powershell
-.\.venv\Scripts\fund status
-.\.venv\Scripts\fund migrate
-```
-
-If any command says `Run: fund migrate`, run:
-
-macOS / Linux:
-
-```bash
-fund migrate
 fund status
-```
-
-Windows PowerShell:
-
-```powershell
-fund migrate
-fund status
-```
-
-## Command Map
-
-Use this as the quick index. Commands are grouped by how you use them day to day.
-
-### Overview
-
-These commands tell you what exists and what to do next.
-
-`fund status`
-- overall database state
-- how many proposals, approved facts, and return rows exist
-- schema version, current-doc counts, PDF count, and cached image footprint
-
-`fund list`
-- all funds
-- the short handle to type, like `simplex` or `ichigo`
-
-`fund inbox`
-- the pending review queue grouped by fund
-- shows verified counts, conflicts, and the next review command
-
-`fund next`
-- reads the current database state and suggests one useful next command
-- start here when you are unsure what to do
-
-### Add / Extract / Review
-
-These commands move documents into approved truth.
-
-`fund add-doc --fund <fund> --type factsheet --date YYYY-MM-DD <path>`
-- copies the PDF into normalized per-fund storage
-- marks it as the new current factsheet/presentation
-- keeps the old document for audit
-- ingests pages immediately
-
-`fund onboard <fund>`
-- runs the full extraction plan for that fund
-- factsheets route to terms / metrics / returns extraction
-- presentations route to qualitative strategy / people extraction
-
-`fund review <fund> --list`
-- shows the pending proposed factsheet
-- this is the approval inbox, not the final output
-- shows quote verification status next to each proposed fact
-
-`fund pending <fund>`
-- friendlier alias for `fund review <fund> --list`
-
-`fund review <fund>`
-- interactive approval flow
-- approve, edit, reject, or skip pending proposals
-
-`fund review <fund> --approve-verified`
-- approves verified proposals only when they have no field conflict
-- leaves anything ambiguous for manual review
-
-`fund approve <proposal_id>` / `fund reject <proposal_id>`
-- approve or reject a single proposal or proposed return row
-
-### Approved Data Views
-
-These commands show approved source-of-truth data.
-
-`fund factsheet <fund> --sources`
-- shows the approved source-of-truth factsheet
-- this is the clean profile to trust for later comparison
-- reported metrics are shown as sourced facts
-- computed return analytics are shown separately as internal, annualized calculations
-
-`fund factsheet <fund> --save`
-- saves one current hashed JSON snapshot for that fund
-- removes older saved snapshots for the same fund
-- writes a `changes` section explaining what changed versus the previous snapshot
-
-`fund returns <fund>`
-- shows approved structured return rows only
-
-### Analytical And Functional Tools
-
-These commands compare, screen, rank, export, or analyze approved data.
-
-`fund screen`
-- screens funds using approved facts plus computed internal analytics
-- no LLM calls
-- examples:
-  - `fund screen --sort "annualized_sharpe desc"`
-  - `fund screen --preset small-cap-activist --min-history 3`
-  - `fund screen --where "management_fee<=1.5" --sort "annualized_sharpe desc"`
-
-`fund similar <fund>`
-- ranks other funds by deterministic qualitative similarity
-- uses approved strategy, activism style, geography, market-cap focus, AUM, and reported metrics
-- intentionally excludes terms and return history
-- examples:
-  - `fund similar simplex --limit 5`
-  - `fund similar --all --limit 20`
-
-`fund compare <fund1> <fund2>`
-- compares approved data only
-- does not use pending facts
-- leads with a synthesis paragraph
-- tables are focused on terms, reported metrics, and returns
-- return-derived risk stats are labeled computed/internal and annualized
-
-`fund export <fund>`
-- writes a Markdown factsheet to stdout
-- includes sections, provenance, presentation highlights, annual returns,
-  computed analytics, drawdown, peer-relative context, and a sources appendix
-- use `--no-peer-context` to omit peer medians/ranks
-
-`fund export compare <fund1> <fund2> [fund3...]`
-- writes a Markdown side-by-side comparison to stdout
-- useful when you want something greppable, diffable, or shareable
-
-`fund analyze --funds a,b -q "..."`
-- runs LLM analysis on approved snapshots only
-- this is a separate reasoning step after facts are approved
-- use it after `factsheet`, `returns`, `similar`, and `compare`, not instead of them
-
-`fund analyze-activism --funds a,b`
-- runs a web-backed reality check using English and Japanese web search by default
-- compares what the funds say in approved materials against public activism examples
-- translates Japanese findings into English and keeps the output English-only
-- keeps the conclusion to one paragraph, then lists the public examples used
-- requires internet/API access; if it fails with a connection error, the database
-  may still be fine, but the live web-backed OpenAI call did not complete
-
-Any future web-backed fund search should follow the same rule: search both English
-and Japanese sources, translate Japanese evidence into English, and keep source URLs
-attached. Raw Japanese should not be shown by default except for proper names.
-
-### Operational Checks
-
-These commands keep the system clean and sane.
-
-`fund doctor`
-- checks DB path, schema version, Python executable, API key presence, and pending queue
-
-`fund migrate`
-- applies schema and storage migrations explicitly
-- use this after code updates that change the database layout
-
-`fund verify`
-- runs deterministic quote checks over staged proposals and return rows
-- no LLM calls
-- use `fund verify --doc doc_003` to scope it to one document
-- statuses include `verified_text`, `unverified_text`, and `unverifiable_vision`
-
-`fund reconcile <fund>`
-- runs deterministic QC over approved return rows
-- compares reported annual rows against compounded monthly rows
-- compares YTD rows against compounded monthly rows for the same year
-- flags monthly rows outside broad sanity bounds
-- no LLM calls
-
-`fund prune`
-- deletes cached page images only
-- page images are regenerable cache, not source data
-
-## The Important Difference: Review vs Factsheet
-
-`review` and `factsheet` are not the same thing.
-
-`fund review simplex --list`
-- proposed / pending values
-- used to decide what to approve
-
-`fund factsheet simplex --sources`
-- approved values only
-- used as source-of-truth
-
-So the intended sequence is:
-
-1. `fund onboard ichigo`
-2. `fund review ichigo --list`
-3. `fund review ichigo`
-4. `fund factsheet ichigo --sources`
-5. `fund returns ichigo`
-6. `fund similar ichigo`
-7. `fund compare ichigo simplex`
-8. `fund analyze --funds ichigo,simplex -q "..."`
-
-## Recommended Daily Flow
-
-For a new fund:
-
-```bash
+fund inbox
 fund next
-fund onboard ichigo
-fund review ichigo --list
-fund review ichigo
-fund factsheet ichigo --sources
-fund returns ichigo
+fund list
 ```
 
-For a refreshed factsheet:
+`fund inbox` is the review queue. `fund next` is the quickest way to resume
+after an interruption.
 
-```bash
-fund add-doc --fund simplex --type factsheet --date 2026-06-30 ~/Downloads/simplex_june.pdf
+### 2. Find a current source document without changing anything
+
+```powershell
+fund discover-docs --root "T:\Research\General\20 Japan-Focused Hedge Funds"
+fund crosswalk --root "T:\Research\General\20 Japan-Focused Hedge Funds"
+fund refresh --root "T:\Research\General\20 Japan-Focused Hedge Funds"
+```
+
+This is read-only. It inventories PDFs, infers only filename candidates, hashes
+each file, and identifies documents already known to the database. It does not
+copy files, create documents, call an API, or alter the database.
+
+`fund crosswalk` maps immediate T-drive folders to reviewed fund identities.
+Add a reviewed alias when a known folder uses a different label:
+
+```powershell
+fund alias --fund simplex "Simplex Long Short / Value Up"
+```
+
+`fund refresh` is the one-command preflight: it combines the folder mapping,
+document inventory, newest filename-classified factsheet, and the next action.
+It skips file hashing to stay fast; run `fund discover-docs` on a chosen folder
+before registration when you need SHA-256 duplicate confirmation.
+
+Choose the most recent factsheet by the document's stated as-of date, not just
+by Windows modified time. A presentation is supporting evidence; a factsheet is
+the normal source for terms, AUM, and returns.
+
+### 3. Register one selected source
+
+```powershell
+fund add-doc --fund simplex --type factsheet --date 2026-06-30 \
+  "T:\Research\General\20 Japan-Focused Hedge Funds\Simplex\factsheet.pdf"
+```
+
+When the path is inside `FUND_SOURCE_DOC_ROOT`, the PDF stays external by
+default. The command records its source path and hash and ingests page text.
+Use `--external` to make that choice explicit. Use `--copy` only for a document
+that is meant to be managed locally.
+
+Do not use `fund ingest` for normal research. It is the sample/seed bootstrap
+command, retained for tests and a fresh demonstration database.
+
+### 4. Preflight extraction, then extract
+
+```powershell
 fund onboard simplex --dry-run
 fund onboard simplex
-fund review simplex --list
-fund review simplex
-fund factsheet simplex --sources
-fund factsheet simplex --save
-```
-
-For already-approved funds:
-
-```bash
-fund inbox
-fund factsheet simplex --sources
-fund returns simplex
+fund verify
 fund reconcile simplex
-fund similar simplex --limit 5
-fund similar --all --limit 20
-fund screen --sort "annualized_sharpe desc"
-fund screen --preset small-cap-activist --min-history 3
-fund compare simplex begonia
-fund compare simplex begonia --embedding-similarity
-fund export simplex
-fund export compare simplex begonia
-fund analyze --funds simplex,begonia -q "What are the key differences in strategy, terms, and approved return history?"
-fund analyze-activism --funds simplex,begonia
 ```
 
-## Reported vs Computed
+The dry run is required before a live extraction call. `fund onboard` routes a
+factsheet to terms, metrics, and returns; it routes a presentation to strategy
+and people. It creates proposals only—never approved facts.
 
-Reported values:
-
-- come from approved PDF facts
-- keep their source document/page/quote
-- include fields like AUM, beta, volatility, Sharpe ratio, and information ratio
-
-Computed values:
-
-- come only from approved structured return rows
-- are labeled internal
-- use `FUND_RISK_FREE_RATE` and `FUND_PERIODS_PER_YEAR`
-- use the shared analytics spine in `fund/analytics.py`
-- include cumulative return, annualized volatility, annualized Sharpe, Sortino,
-  positive-period percentage, rolling return history, and max drawdown
-
-The system should never make an internal calculation look like a manager-reported metric.
-
-## Compare vs Analyze
-
-`fund compare ...`
-- deterministic
-- approved data only
-- best for clean table-based comparison
-
-`fund similar ...`
-- deterministic
-- approved data only
-- best for qualitative peer ranking and future clustering
-- does not use terms or return history in the similarity score
-
-`fund analyze ...`
-- LLM reasoning on approved snapshots only
-- best for synthesis, tradeoffs, and written comparison paragraphs
-- should be treated as an interpretation layer, not source-of-truth
-
-`fund analyze-activism ...`
-- LLM reasoning plus English and Japanese web search
-- best for the specific question: "what do they say they do, and what do public events suggest they actually do?"
-- Japanese findings are translated into English before display
-- still separate from source-of-truth; it interprets approved internal data plus public evidence
-
-## Snapshots
-
-`fund factsheet <fund> --save` and analysis commands save one current snapshot per fund.
-
-- the file name is still content-hashed
-- older saved snapshots for the same fund are removed automatically
-- factsheet snapshots are local artifacts and are gitignored
-- the retained file includes a `changes` block showing what changed versus the previous snapshot
-- the approved database remains the source of truth; snapshots are reproducibility/artifact files
-
-## Moving To A Windows VM
-
-Recommended route: push the cleaned repo to GitHub, clone it on the Microsoft
-desktop, then rebuild the environment there.
-
-Full handoff checklist: [VM_MIGRATION_PLAN.md](VM_MIGRATION_PLAN.md).
-
-Do:
+For narrow work, use the explicit command instead:
 
 ```powershell
-git clone <repo-url>
-cd <repo>
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -e .
-Copy-Item .env.example .env
+fund extract doc_003 --scope profile_terms --dry-run
+fund extract doc_003 --scope profile_terms
+fund extract doc_003 --returns --page 1
+```
+
+Every model call goes through the logged extraction path. Check `fund log` if a
+call fails or costs need to be reviewed.
+
+### 5. Review evidence and approve only what is supported
+
+```powershell
+fund review simplex --list
+fund review simplex --approve-verified
+fund review simplex
+fund factsheet simplex --sources
+```
+
+`--approve-verified` is appropriate only for proposals whose deterministic
+quote check passes and which have no conflict. It is a convenience, not a truth
+guarantee: confirm that the quote, page, document date, and field meaning match
+before using the result. Use interactive review for numbers in tables,
+ambiguous wording, and conflicts.
+
+## Produce an answer from approved data
+
+```powershell
+fund factsheet simplex --sources
+fund search "shareholder proposal" --fund simplex
+fund returns simplex
+fund screen --preset small-cap-activist --min-history 3 --activist-only
+fund similar simplex --limit 5 --activist-only
+fund compare simplex begonia
+fund compare simplex begonia --web-reality-check --dry-run
+fund export simplex
+fund export compare simplex begonia
+```
+
+These are deterministic, local operations over approved data. They do not call
+an LLM. `similar` uses the explicit qualitative fields; it is a research lead,
+not proof that a peer is an activist. `screen` and `similar` should be used only
+after the universe has been classified with approved activism and activity facts.
+
+`fund search` is the local evidence retrieval tool. It searches extracted page
+text and returns the fund, document, page, excerpt, and original source path.
+It is deliberately citation-first rather than a generic RAG/vector search.
+
+`fund compare` is deterministic by default. Add `--web-reality-check` only
+after reviewing the deterministic comparison; its dry run prints the planned
+English and Japanese public-search queries without making an API call.
+
+Use these commands before any narrative analysis. They make the evidence and
+the calculations inspectable instead of asking a model to rediscover them.
+
+## Analysis and public web validation
+
+```powershell
+fund analyze --funds simplex,begonia -q "Compare the approved strategies."
+fund analyze --funds simplex,begonia -q "..." --dry-run
+fund analyze-activism --funds simplex,begonia --dry-run
+```
+
+`fund analyze` sends approved factsheet snapshots to the configured model and
+saves the resulting analysis. Always dry-run first.
+
+`fund analyze-activism` is a separate, policy-dependent convenience for public
+English- and Japanese-language web research. It must never auto-approve a fact.
+In this managed environment, policy blocks sending workspace-derived snapshots
+to an external web-enabled model. That is a tenant data-egress control, not a
+missing API key or a lack of user permission. The dry run remains useful because
+it shows the exact planned search context without transmitting it.
+
+When that policy applies, keep web validation outside this command: collect the
+public source URL, document date, quoted passage, and relevant page locally;
+save a dated PDF in the approved T-drive source root, then register it as
+supporting evidence and approve only after review:
+
+```powershell
+fund add-doc --fund simplex --type evidence --date 2026-07-17 `
+  "T:\Research\...\public_source.pdf"
+```
+
+Supporting evidence never becomes the current factsheet and cannot outrank a
+factsheet during conflict resolution. A local
+deployment whose policy permits the call can use the live command, but its
+output is still research material until source-backed facts are reviewed.
+
+## Activist-universe decision rule
+
+Maintain these two sourced facts for every fund under consideration:
+
+| Field | Allowed values | Meaning |
+| --- | --- | --- |
+| `activist_universe_status` | `candidate`, `verified_activist`, `excluded` | Whether the fund belongs in the activist universe. |
+| `activity_status` | `active`, `uncertain`, `inactive` | Whether current evidence supports treating the fund as operating. |
+
+Use the most recent reliable manager factsheet, official manager site or filing,
+and (when relevant) a public engagement/ownership record. Apply these rules:
+
+- **active**: current evidence (normally within 12 months) shows the fund or
+  strategy is offered, reporting, investing, or actively managed.
+- **uncertain**: evidence is stale, contradictory, or only proves the historic
+  strategy; retain the fund but flag it for refresh.
+- **inactive**: a reliable source states liquidation, closure, merger, or that
+  the strategy has stopped accepting/managing capital.
+- **verified_activist**: the manager or a high-quality public source explicitly
+  describes engagement, shareholder proposals, governance/value-up action, or
+  an equivalent activist mandate.
+- **candidate**: plausible activist lead, not yet proven. Do not include it in
+  activist comparisons by default.
+
+Each status requires its own document/page/quote evidence. Never infer active
+or activist from a folder name, performance history, or a similar fund.
+
+Record a human-reviewed classification directly from its evidence:
+
+```powershell
+fund classify simplex --activist verified_activist --activity active `
+  --doc doc_003 --page 1 --quote "Exact supporting source text"
+fund universe
+```
+
+`fund screen --activist-only` and `fund similar --activist-only` apply the
+strict rule. Add `--include-uncertain` or `--include-candidates` only when that
+broader universe is intentional.
+
+## Advanced and maintenance commands
+
+```powershell
+fund verify --doc doc_003       # re-run deterministic evidence checks
+fund reconcile simplex          # compare approved monthly/annual/YTD returns
+fund factsheet simplex --save   # write one local, regenerable snapshot
+fund analyses                   # list saved narrative analyses
+fund show an_xxx                # display one saved analysis
+fund log                        # model-call audit log
+fund prune                      # remove only regenerable page-image cache
+```
+
+`fund factsheet --save` retains one current snapshot per fund with a change
+summary. Snapshots are convenience artifacts; the database remains the source
+of truth.
+
+## Before handing off a result
+
+```powershell
+.\.venv\Scripts\python.exe -m tests.test_pipeline
 fund doctor
+fund status
 ```
 
-Do not:
+For a fund-level conclusion, also run:
 
-- copy `.venv/` from macOS; it contains macOS binaries and old unused packages
-- rely on Git to transfer `.env`; add the OpenAI key deliberately on the VM
-- move legacy databases or page-image caches; `data/db/fund.db` is the live DB,
-  while page images and factsheet snapshots are regenerable
-
-## Troubleshooting
-
-If a fund unexpectedly looks empty:
-
-```bash
-echo $FUND_DB_PATH
-python3 -c "from fund.config import DB_PATH; import sys; print(sys.executable); print(DB_PATH)"
+```powershell
+fund factsheet <fund> --sources
+fund reconcile <fund>
 ```
 
-Most likely causes:
-
-- wrong virtualenv
-- wrong `FUND_DB_PATH`
-- looking at a pending queue when you meant to inspect approved data
-
-## What Travels To The VM
-
-Commit and transfer:
-
-- `fund/`
-- `tests/`
-- `data/pdfs/`
-- `README.md`, `TERMINAL_WORKFLOW.md`, `AGENTS.md`
-- packaging files such as `pyproject.toml`
-
-Keep local or recreate:
-
-- `.venv/` (recreate on the VM)
-- `.env` (add the key deliberately on the VM)
-- `data/db/fund.db` unless you intentionally choose a DB transfer path
-- `data/page_images/`
-- `data/factsheets/`
-
-Removed pre-migration ballast:
-
-- old `legacy/` Streamlit/script reference tree
-- old legacy database/backups
-- generated `fund.egg-info/`
-- tracked factsheet snapshots
+State any missing, stale, uncertain, or unverified evidence plainly. The system
+is designed to make those gaps visible, not to fill them with plausible prose.

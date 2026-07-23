@@ -9,8 +9,59 @@ return row upserts into returns the same way, preferring net over gross over unk
 from fund.db import utc_now
 from fund.extract import parse_number
 from fund.schema import FIELDS
+from fund.verification import verify_quote
 
 _RETURN_QUALITY = {"net": 2, "gross": 1, "unknown": 0}
+
+
+def approve_sourced_fact(connection, *, fund_id, field_key, value, doc_id, page,
+                          quote, reviewer, as_of_date=None):
+    """Human-entered, source-backed approval for a small classification update.
+
+    This intentionally shares the same `facts` upsert boundary as proposal
+    approval. It is for reviewed status facts that are sourced from a known
+    document, not a shortcut around evidence requirements.
+    """
+    if field_key not in FIELDS:
+        raise ValueError(f"Unknown field: {field_key}")
+    if not str(value or "").strip() or not str(quote or "").strip():
+        raise ValueError("A value and supporting quote are required.")
+    if page is None or page < 1:
+        raise ValueError("A source page is required.")
+    document = connection.execute(
+        "SELECT fund_id, doc_date FROM documents WHERE doc_id = ?", (doc_id,)
+    ).fetchone()
+    if document is None or document["fund_id"] != fund_id:
+        raise ValueError("The source document must belong to the selected fund.")
+    if not connection.execute(
+        "SELECT 1 FROM pages WHERE doc_id = ? AND page_number = ?", (doc_id, page)
+    ).fetchone():
+        raise ValueError(f"Page {page} is not available for {doc_id}.")
+    final_value = str(value).strip()
+    if field_key == "activity_status" and final_value not in {"active", "uncertain", "inactive"}:
+        raise ValueError("Activity status must be active, uncertain, or inactive.")
+    if field_key == "activist_universe_status" and final_value not in {
+        "candidate", "verified_activist", "excluded"
+    }:
+        raise ValueError("Universe status must be candidate, verified_activist, or excluded.")
+    value_num = parse_number(final_value) if FIELDS[field_key][2] == "number" else None
+    connection.execute(
+        """
+        INSERT INTO facts (fund_id, field_key, share_class, value, value_num, unit, as_of_date,
+                           doc_id, page, quote, approved_by, approved_at)
+        VALUES (?, ?, '', ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (fund_id, field_key, share_class) DO UPDATE SET
+            value = excluded.value, value_num = excluded.value_num, unit = excluded.unit,
+            as_of_date = excluded.as_of_date, doc_id = excluded.doc_id, page = excluded.page,
+            quote = excluded.quote, approved_by = excluded.approved_by,
+            approved_at = excluded.approved_at
+        """,
+        (fund_id, field_key, final_value, value_num, as_of_date or document["doc_date"],
+         doc_id, page, quote, reviewer, utc_now()),
+    )
+    evidence = verify_quote(connection, doc_id=doc_id, page=page, quote=quote)
+    connection.commit()
+    return evidence
 
 
 def doc_meta(connection, fund_id):
@@ -26,9 +77,9 @@ def _rank_key(proposal, meta):
     presentation, then the most recent source document, then higher confidence,
     then later extraction. Undated/unknown docs sort lowest."""
     info = meta.get(proposal["doc_id"], {})
-    is_factsheet = 1 if info.get("type") == "factsheet" else 0
+    source_rank = {"factsheet": 2, "presentation": 1, "evidence": 0}.get(info.get("type"), 0)
     is_current = 1 if info.get("is_current") else 0
-    return (is_factsheet, is_current, info.get("date") or "",
+    return (source_rank, is_current, info.get("date") or "",
             proposal.get("confidence") or 0.0, proposal.get("created_at") or "")
 
 

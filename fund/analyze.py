@@ -10,12 +10,11 @@ Analyses remain separate from the source-of-truth pipeline. They interpret
 approved data; they never write facts.
 """
 import json
-import math
 from uuid import uuid4
 
-from fund.config import ANALYSIS_MODEL, EMBEDDING_MODEL, WEB_ANALYSIS_MODEL
+from fund.config import ANALYSIS_MODEL, WEB_ANALYSIS_MODEL
 from fund.db import utc_now
-from fund.factsheet import annual_display_series, snapshot_factsheet
+from fund.factsheet import factsheet_payload, snapshot_factsheet
 from fund.llm import call
 
 
@@ -87,6 +86,23 @@ WEB FINDINGS:
   - unknown | No concrete public activism example found | none | none
 - Do not invent dates or URLs.
 """.strip()
+
+
+def public_query_examples(context):
+    """Show the planned bilingual public-search coverage without an API call."""
+    names = [context["fund_name"]]
+    if context.get("manager_name"):
+        names.append(context["manager_name"])
+    queries = []
+    for name in names:
+        queries.extend([
+            f'{name} shareholder proposal Japan',
+            f'{name} activist engagement Japan',
+            f'{name} 株主提案',
+            f'{name} アクティビスト 対話',
+            f'{name} 大量保有報告書',
+        ])
+    return queries
 
 
 def build_public_examples_retry_prompt(context):
@@ -188,11 +204,13 @@ def activism_analysis_context(snapshot):
     }
 
 
-def _load_snapshots(connection, fund_ids):
+def _load_snapshots(connection, fund_ids, persist=False):
     snapshots, hashes = [], []
     for fund_id in fund_ids:
-        path, digest = snapshot_factsheet(connection, fund_id)
-        snapshots.append(json.loads(path.read_text()))
+        snapshot, digest = factsheet_payload(connection, fund_id)
+        if persist:
+            snapshot_factsheet(connection, fund_id)
+        snapshots.append(snapshot)
         hashes.append(digest)
     return snapshots, hashes
 
@@ -237,7 +255,7 @@ def extract_web_sources(response):
 
 
 def run_analysis(connection, fund_ids, question, dry_run=False):
-    snapshots, hashes = _load_snapshots(connection, fund_ids)
+    snapshots, hashes = _load_snapshots(connection, fund_ids, persist=not dry_run)
     prompt = build_analysis_prompt(snapshots, question)
     if dry_run:
         return {"fund_ids": fund_ids, "snapshot_hashes": hashes,
@@ -263,7 +281,7 @@ def run_analysis(connection, fund_ids, question, dry_run=False):
 
 
 def run_activism_reality_analysis(connection, fund_ids, dry_run=False):
-    snapshots, hashes = _load_snapshots(connection, fund_ids)
+    snapshots, hashes = _load_snapshots(connection, fund_ids, persist=not dry_run)
     contexts = [activism_analysis_context(snapshot) for snapshot in snapshots]
     search_prompts = [build_public_examples_prompt(context) for context in contexts]
     synthesis_prompt = build_activism_reality_prompt(
@@ -277,6 +295,10 @@ def run_activism_reality_analysis(connection, fund_ids, dry_run=False):
             "snapshot_hashes": hashes,
             "search_prompt_chars": [len(prompt) for prompt in search_prompts],
             "synthesis_prompt_chars": len(synthesis_prompt),
+            "public_query_examples": {
+                context["fund_id"]: public_query_examples(context)
+                for context in contexts
+            },
             "dry_run": True,
             "tools": ["web_search_preview"],
         }
@@ -364,126 +386,3 @@ def format_activism_reality_result(output_text, web_sources=None):
         for url in web_sources[:12]:
             lines.append(f"  - {url}")
     return "\n".join(lines)
-
-
-def snapshot_text(snapshot):
-    lines = [
-        f"Fund: {snapshot.get('fund_name')}",
-        f"Manager: {snapshot.get('manager_name')}",
-    ]
-    for section_name, entries in snapshot.get("sections", {}).items():
-        values = [entry for entry in entries if entry.get("value") is not None]
-        if not values:
-            continue
-        lines.append(section_name.upper())
-        for entry in values:
-            lines.append(f"{entry['label']}: {entry['value']}")
-    for share_class, payload in (snapshot.get("share_classes") or {}).items():
-        lines.append(f"SHARE CLASS: {share_class}")
-        for entries in payload.get("sections", {}).values():
-            for entry in entries:
-                if entry.get("value") is not None:
-                    lines.append(f"{entry['label']}: {entry['value']}")
-    annual = annual_display_series(snapshot.get("returns") or [])
-    if annual:
-        lines.append("ANNUAL RETURNS")
-        for block in annual:
-            cls = block["share_class"] or "(unspecified)"
-            lines.append(f"{cls} [{block['source']}]")
-            for row in block["rows"]:
-                lines.append(f"{row['period_end'][:4]}: {row['return_pct']}")
-    for row in (snapshot.get("returns") or []):
-        if row.get("period_type") == "ytd":
-            lines.append(
-                f"YTD {row.get('share_class') or '(unspecified)'} {row['period_end']}: {row['return_pct']}"
-            )
-    return "\n".join(lines)
-
-
-def _dot(a, b):
-    return sum(x * y for x, y in zip(a, b))
-
-
-def _norm(v):
-    return math.sqrt(_dot(v, v))
-
-
-def cosine_similarity(a, b):
-    denom = _norm(a) * _norm(b)
-    if not denom:
-        return None
-    return round(_dot(a, b) / denom, 3)
-
-
-def _load_cached_embedding(connection, snapshot_hash):
-    row = connection.execute(
-        """
-        SELECT embedding_vector
-        FROM snapshot_embeddings
-        WHERE snapshot_hash = ? AND embedding_model = ?
-        """,
-        (snapshot_hash, EMBEDDING_MODEL),
-    ).fetchone()
-    if row is None:
-        return None
-    return json.loads(row["embedding_vector"])
-
-
-def _store_cached_embedding(connection, snapshot_hash, fund_id, vector):
-    connection.execute(
-        """
-        INSERT OR REPLACE INTO snapshot_embeddings (
-            snapshot_hash, fund_id, embedding_model, embedding_vector, created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (snapshot_hash, fund_id, EMBEDDING_MODEL, json.dumps(vector), utc_now()),
-    )
-
-
-def factsheet_embedding_similarity(connection, fund_ids, dry_run=False):
-    snapshots, hashes = _load_snapshots(connection, fund_ids)
-    texts = [snapshot_text(snapshot) for snapshot in snapshots]
-    if dry_run:
-        return {
-            "fund_ids": fund_ids,
-            "snapshot_hashes": hashes,
-            "chars": [len(text) for text in texts],
-            "dry_run": True,
-        }
-
-    from openai import OpenAI
-    vectors = []
-    missing = []
-    missing_positions = []
-    for index, snapshot_hash in enumerate(hashes):
-        cached = _load_cached_embedding(connection, snapshot_hash)
-        if cached is None:
-            missing.append(texts[index])
-            missing_positions.append(index)
-            vectors.append(None)
-        else:
-            vectors.append(cached)
-    if missing:
-        client = OpenAI()
-        response = client.embeddings.create(model=EMBEDDING_MODEL, input=missing)
-        for position, item in zip(missing_positions, response.data):
-            vector = item.embedding
-            vectors[position] = vector
-            _store_cached_embedding(connection, hashes[position], fund_ids[position], vector)
-        connection.commit()
-    pairs = []
-    for i, left in enumerate(fund_ids):
-        for j in range(i + 1, len(fund_ids)):
-            right = fund_ids[j]
-            pairs.append({
-                "left": left,
-                "right": right,
-                "cosine_similarity": cosine_similarity(vectors[i], vectors[j]),
-            })
-    return {
-        "fund_ids": fund_ids,
-        "snapshot_hashes": hashes,
-        "model": EMBEDDING_MODEL,
-        "pairs": pairs,
-    }

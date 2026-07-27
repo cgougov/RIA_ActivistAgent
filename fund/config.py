@@ -13,11 +13,11 @@ PDF_DIR = DATA_DIR / "pdfs"
 PAGE_IMAGE_DIR = DATA_DIR / "page_images"
 SEED_DIR = DATA_DIR / "seed"
 FACTSHEET_DIR = DATA_DIR / "factsheets"
+SOURCE_DOC_ROOT = os.getenv("FUND_SOURCE_DOC_ROOT", "").strip()
 
 EXTRACT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 ANALYSIS_MODEL = os.getenv("OPENAI_ANALYSIS_MODEL", "gpt-5.2")
 WEB_ANALYSIS_MODEL = os.getenv("OPENAI_WEB_ANALYSIS_MODEL", ANALYSIS_MODEL)
-EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")
 REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "medium")
 RISK_FREE_RATE = float(os.getenv("FUND_RISK_FREE_RATE", "0.0"))
 PERIODS_PER_YEAR = int(os.getenv("FUND_PERIODS_PER_YEAR", "12"))

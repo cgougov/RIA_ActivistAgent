@@ -36,6 +36,8 @@ FIELDS = {
     "administrator": ("overview", "Administrator", "text", None, "The fund administrator named in the source."),
     "auditor": ("overview", "Auditor", "text", None, "The fund auditor named in the source."),
     "custodian": ("overview", "Custodian", "text", None, "The custodian or prime broker named in the source."),
+    "activity_status": ("overview", "Activity status", "text", None, "Current operating status: active, uncertain, or inactive. Only approve from dated, source-backed evidence."),
+    "activist_universe_status": ("overview", "Activist universe status", "text", None, "Universe classification: candidate, verified_activist, or excluded. Only approve with explicit activism evidence."),
 
     # People (role-specific fields only; key_people catches the rest)
     "chief_investment_officer": ("people", "CIO", "text", None, "The named chief investment officer."),

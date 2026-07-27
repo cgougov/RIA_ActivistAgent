@@ -5,6 +5,7 @@ and renders page images on demand for vision extraction. No LLM calls happen
 here.
 """
 import csv
+import calendar
 import hashlib
 import re
 import shutil
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 import fitz
 
-from fund.config import PAGE_IMAGE_DIR, PDF_DIR, PROJECT_ROOT, SEED_DIR
+from fund.config import PAGE_IMAGE_DIR, PDF_DIR, PROJECT_ROOT, SEED_DIR, SOURCE_DOC_ROOT
 from fund.db import utc_now
 
 CURRENT_DOC_TYPES = {"factsheet", "presentation"}
@@ -38,6 +39,138 @@ def register_fund(connection, fund_id, fund_name, manager_name, notes=None):
         """,
         (fund_id, fund_name, manager_name, notes, utc_now()),
     )
+
+
+def identity_key(value):
+    """Stable identity matching for folder names, aliases, and fund handles."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def register_alias(connection, fund_id, alias, alias_type="manual"):
+    alias = str(alias or "").strip()
+    if not alias:
+        raise ValueError("Alias cannot be blank.")
+    if not connection.execute("SELECT 1 FROM funds WHERE fund_id = ?", (fund_id,)).fetchone():
+        raise ValueError(f"Unknown fund_id: {fund_id}")
+    existing = connection.execute(
+        "SELECT fund_id FROM fund_aliases WHERE alias = ?", (alias,)
+    ).fetchone()
+    if existing and existing["fund_id"] != fund_id:
+        raise ValueError(f"Alias '{alias}' already belongs to {existing['fund_id']}")
+    connection.execute(
+        """
+        INSERT INTO fund_aliases (alias, fund_id, alias_type, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(alias) DO UPDATE SET fund_id = excluded.fund_id,
+            alias_type = excluded.alias_type
+        """,
+        (alias, fund_id, alias_type, utc_now()),
+    )
+    connection.commit()
+
+
+def list_aliases(connection, fund_id=None):
+    where, params = "", []
+    if fund_id:
+        where, params = "WHERE a.fund_id = ?", [fund_id]
+    return [dict(row) for row in connection.execute(
+        f"""
+        SELECT a.alias, a.alias_type, a.fund_id, f.fund_name, f.manager_name
+        FROM fund_aliases a JOIN funds f ON f.fund_id = a.fund_id
+        {where}
+        ORDER BY f.fund_name, a.alias COLLATE NOCASE
+        """,
+        params,
+    ).fetchall()]
+
+
+def crosswalk_folders(connection, root):
+    """Read-only, conservative mapping from immediate source folders to funds."""
+    root = Path(root)
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"Source root does not exist or is not a directory: {root}")
+    terms = {}
+    for row in connection.execute("SELECT fund_id, fund_name, manager_name FROM funds"):
+        for label, kind in ((row["fund_name"], "fund_name"), (row["manager_name"], "manager_name")):
+            key = identity_key(label)
+            if key:
+                terms.setdefault(key, []).append((row["fund_id"], label, kind))
+    for row in connection.execute("SELECT fund_id, alias FROM fund_aliases"):
+        key = identity_key(row["alias"])
+        if key:
+            terms.setdefault(key, []).append((row["fund_id"], row["alias"], "alias"))
+
+    results = []
+    for folder in sorted((item for item in root.iterdir() if item.is_dir()), key=lambda item: item.name.lower()):
+        folder_key = identity_key(folder.name)
+        exact = terms.get(folder_key, [])
+        if exact:
+            fund_ids = sorted({item[0] for item in exact})
+            status = "exact" if len(fund_ids) == 1 else "ambiguous"
+            results.append({
+                "folder": folder.name,
+                "path": str(folder),
+                "status": status,
+                "fund_ids": fund_ids,
+                "matched_terms": [item[1] for item in exact],
+            })
+            continue
+
+        likely = []
+        for key, candidates in terms.items():
+            if len(key) < 8 or not (key in folder_key or folder_key in key):
+                continue
+            likely.extend(candidates)
+        fund_ids = sorted({item[0] for item in likely})
+        results.append({
+            "folder": folder.name,
+            "path": str(folder),
+            "status": "likely" if len(fund_ids) == 1 else ("ambiguous" if fund_ids else "unmatched"),
+            "fund_ids": fund_ids,
+            "matched_terms": sorted({item[1] for item in likely}),
+        })
+    return results
+
+
+def refresh_preflight(connection, root, include_unmatched=False):
+    """One read-only view of folder mapping, newest factsheets, and next actions."""
+    root = Path(root).resolve()
+    mappings = crosswalk_folders(connection, root)
+    if not include_unmatched:
+        mappings = [row for row in mappings if row["status"] != "unmatched"]
+    documents = []
+    for mapping in mappings:
+        documents.extend(discover_source_documents(
+            connection, mapping["path"], hash_files=False,
+        ))
+    by_folder = {}
+    for row in documents:
+        try:
+            relative = Path(row["path"]).resolve().relative_to(root)
+        except ValueError:
+            continue
+        if not relative.parts:
+            continue
+        by_folder.setdefault(relative.parts[0], []).append(row)
+
+    rows = []
+    for mapping in mappings:
+        folder = mapping["folder"]
+        candidates = [row for row in by_folder.get(folder, []) if row["inferred_type"] == "factsheet"]
+        candidates.sort(key=lambda row: (row["inferred_date"] or "", row["modified_at"]), reverse=True)
+        newest = candidates[0] if candidates else None
+        action = "review folder mapping"
+        if mapping["status"] == "exact" and newest:
+            action = "review source hash, then add-doc"
+        elif mapping["status"] == "exact":
+            action = "no filename-classified factsheet"
+        rows.append({
+            **mapping,
+            "pdf_count": len(by_folder.get(folder, [])),
+            "newest_factsheet": newest,
+            "next_action": action,
+        })
+    return rows
 
 
 def slugify(value):
@@ -84,6 +217,10 @@ def resolve_stored_path(stored_path):
 
 
 def document_pdf_path(document):
+    if document.get("source_kind") == "external_file" and document.get("source_path"):
+        source = Path(document["source_path"])
+        if source.exists():
+            return source
     stored = document.get("stored_path")
     if stored:
         path = resolve_stored_path(stored)
@@ -129,6 +266,17 @@ def _copy_pdf_if_needed(source_path, target_path):
     shutil.copy2(source_path, target_path)
 
 
+def should_keep_external(source_path):
+    """Treat files inside the configured shared source root as external by default."""
+    if not SOURCE_DOC_ROOT:
+        return False
+    try:
+        Path(source_path).resolve().relative_to(Path(SOURCE_DOC_ROOT).resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def register_document(
     connection,
     doc_id,
@@ -140,21 +288,30 @@ def register_document(
     *,
     original_file_name=None,
     make_current=True,
+    retain_copy=True,
 ):
     source_path = Path(source_path)
     if not source_path.exists():
         raise FileNotFoundError(f"Missing PDF: {source_path}")
     original_file_name = original_file_name or source_path.name
-    relative = normalized_relative_path(
-        connection,
-        fund_id,
-        doc_type,
-        doc_date,
-        original_file_name,
-        doc_id=doc_id,
-    )
-    target_path = PROJECT_ROOT / relative
-    _copy_pdf_if_needed(source_path, target_path)
+    source_path = source_path.resolve()
+    if retain_copy:
+        relative = normalized_relative_path(
+            connection,
+            fund_id,
+            doc_type,
+            doc_date,
+            original_file_name,
+            doc_id=doc_id,
+        )
+        target_path = PROJECT_ROOT / relative
+        _copy_pdf_if_needed(source_path, target_path)
+        stored_path = relative.as_posix()
+        source_kind = "managed_copy"
+    else:
+        target_path = source_path
+        stored_path = str(source_path)
+        source_kind = "external_file"
     is_current, supersedes_doc_id = _upsert_current_document_state(
         connection,
         fund_id,
@@ -165,9 +322,9 @@ def register_document(
         """
         INSERT INTO documents (
             doc_id, fund_id, file_name, original_file_name, stored_path, sha256,
-            doc_type, title, doc_date, is_current, supersedes_doc_id, created_at
+            doc_type, title, doc_date, is_current, supersedes_doc_id, source_kind, source_path, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (doc_id) DO UPDATE SET
             fund_id = excluded.fund_id,
             file_name = excluded.file_name,
@@ -178,34 +335,42 @@ def register_document(
             title = excluded.title,
             doc_date = excluded.doc_date,
             is_current = excluded.is_current,
-            supersedes_doc_id = COALESCE(excluded.supersedes_doc_id, documents.supersedes_doc_id)
+            supersedes_doc_id = COALESCE(excluded.supersedes_doc_id, documents.supersedes_doc_id),
+            source_kind = excluded.source_kind,
+            source_path = excluded.source_path
         """,
         (
             doc_id,
             fund_id,
             target_path.name,
             original_file_name,
-            relative.as_posix(),
+            stored_path,
             sha256_file(target_path),
             doc_type,
             title,
             doc_date,
             is_current,
             supersedes_doc_id,
+            source_kind,
+            str(source_path),
             utc_now(),
         ),
     )
     return {
         "doc_id": doc_id,
-        "stored_path": relative.as_posix(),
+        "stored_path": stored_path,
+        "source_kind": source_kind,
+        "source_path": str(source_path),
         "is_current": bool(is_current),
         "supersedes_doc_id": supersedes_doc_id,
     }
 
 
-def add_document(connection, fund_id, doc_type, doc_date, source_path, title=None):
+def add_document(connection, fund_id, doc_type, doc_date, source_path, title=None, external=None):
     doc_id = f"doc_{uuid4().hex[:8]}"
     source_path = Path(source_path)
+    if external is None:
+        external = should_keep_external(source_path)
     title = title or source_path.stem.replace("_", " ")
     meta = register_document(
         connection,
@@ -217,6 +382,7 @@ def add_document(connection, fund_id, doc_type, doc_date, source_path, title=Non
         doc_date,
         original_file_name=source_path.name,
         make_current=True,
+        retain_copy=not external,
     )
     ingest_result = ingest_pages(connection, doc_id, force=True)
     connection.commit()
@@ -226,10 +392,104 @@ def add_document(connection, fund_id, doc_type, doc_date, source_path, title=Non
         "doc_type": doc_type,
         "doc_date": doc_date,
         "stored_path": meta["stored_path"],
+        "source_kind": meta["source_kind"],
+        "source_path": meta["source_path"],
         "is_current": meta["is_current"],
         "supersedes_doc_id": meta["supersedes_doc_id"],
         "pages": ingest_result["pages"],
     }
+
+
+def infer_document_type(path):
+    """Conservative filename classification for discovery only, never a fact."""
+    label = path.name.lower()
+    if any(token in label for token in ("factsheet", "monthly", "performance", "quarterly letter", "monthly letter")):
+        return "factsheet"
+    if any(token in label for token in ("presentation", "intro", "overview", "deck")):
+        return "presentation"
+    return "unknown"
+
+
+def infer_document_date(path):
+    """Return a filename-derived candidate date, or None when the filename is ambiguous."""
+    label = path.name
+    full = re.search(r"(?<!\d)(20\d{2})[-_.](\d{2})[-_.](\d{2})(?!\d)", label)
+    if full:
+        return "-".join(full.groups())
+    month = re.search(r"(?<!\d)(20\d{2})[-_.]?(0[1-9]|1[0-2])(?!\d)", label)
+    if month:
+        year, number = int(month.group(1)), int(month.group(2))
+        return f"{year:04d}-{number:02d}-{calendar.monthrange(year, number)[1]:02d}"
+    month_names = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+    names = "|".join(month_names)
+    named = re.search(rf"\b({names})\s*[-_, ]+\s*(20\d{{2}})\b", label, re.I)
+    reverse = re.search(rf"\b(20\d{{2}})\s*[-_, ]+\s*({names})\b", label, re.I)
+    if named:
+        name, year = named.group(1).lower(), int(named.group(2))
+        number = month_names[name]
+        return f"{year:04d}-{number:02d}-{calendar.monthrange(year, number)[1]:02d}"
+    if reverse:
+        year, name = int(reverse.group(1)), reverse.group(2).lower()
+        number = month_names[name]
+        return f"{year:04d}-{number:02d}-{calendar.monthrange(year, number)[1]:02d}"
+    return None
+
+
+def discover_source_documents(connection, root, hash_files=True):
+    """Read-only external-PDF inventory; hashing is optional for fast refreshes."""
+    root = Path(root)
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"Source root does not exist or is not a directory: {root}")
+    known = {}
+    if hash_files:
+        for row in connection.execute("SELECT doc_id, sha256 FROM documents WHERE sha256 IS NOT NULL"):
+            known.setdefault(row["sha256"], []).append(row["doc_id"])
+    results = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file() and item.suffix.lower() == ".pdf"):
+        digest = sha256_file(path) if hash_files else None
+        results.append({
+            "path": str(path),
+            "size_bytes": path.stat().st_size,
+            "modified_at": path.stat().st_mtime,
+            "sha256": digest,
+            "duplicate_doc_ids": known.get(digest, []) if digest else [],
+            "hash_checked": bool(hash_files),
+            "inferred_type": infer_document_type(path),
+            "inferred_date": infer_document_date(path),
+        })
+    return results
+
+
+def search_source_pages(connection, query, fund_id=None, doc_id=None, limit=20):
+    """Local full-text retrieval with document/page provenance; no model call."""
+    terms = re.findall(r"[^\s\"']+", str(query or "").strip())
+    if not terms:
+        raise ValueError("Search query cannot be blank.")
+    match = " AND ".join(f'"{term.replace(chr(34), "")}"' for term in terms)
+    where, params = ["page_search MATCH ?"], [match]
+    if fund_id:
+        where.append("s.fund_id = ?")
+        params.append(fund_id)
+    if doc_id:
+        where.append("s.doc_id = ?")
+        params.append(doc_id)
+    params.append(max(1, min(int(limit), 100)))
+    return [dict(row) for row in connection.execute(
+        f"""
+        SELECT s.fund_id, s.doc_id, s.page_number, d.title, d.doc_type, d.doc_date,
+               d.source_path, snippet(page_search, 3, '[', ']', '...', 24) AS excerpt
+        FROM page_search s
+        JOIN documents d ON d.doc_id = s.doc_id
+        WHERE {' AND '.join(where)}
+        ORDER BY bm25(page_search), COALESCE(d.doc_date, '') DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()]
 
 
 def ingest_pages(connection, doc_id, force=False):
@@ -245,13 +505,20 @@ def ingest_pages(connection, doc_id, force=False):
         return {"doc_id": doc_id, "status": "already_ingested", "pages": existing}
     if force:
         connection.execute("DELETE FROM pages WHERE doc_id = ?", (doc_id,))
+        connection.execute("DELETE FROM page_search WHERE doc_id = ?", (doc_id,))
 
     pdf = fitz.open(document_pdf_path(dict(doc)))
     for index, page in enumerate(pdf, start=1):
+        text = page.get_text()
         connection.execute(
             "INSERT INTO pages (doc_id, page_number, text) VALUES (?, ?, ?)",
-            (doc_id, index, page.get_text()),
+            (doc_id, index, text),
         )
+        if text:
+            connection.execute(
+                "INSERT INTO page_search (doc_id, fund_id, page_number, text) VALUES (?, ?, ?, ?)",
+                (doc_id, doc["fund_id"], index, text),
+            )
     page_count = len(pdf)
     pdf.close()
     connection.execute(
@@ -320,7 +587,7 @@ def organize_existing_documents(connection):
     """Normalize stored PDF paths for documents already in the database."""
     rows = connection.execute(
         """
-        SELECT doc_id, fund_id, file_name, original_file_name, stored_path, doc_type, doc_date
+        SELECT doc_id, fund_id, file_name, original_file_name, stored_path, source_kind, doc_type, doc_date
         FROM documents
         ORDER BY created_at, doc_id
         """
@@ -328,6 +595,8 @@ def organize_existing_documents(connection):
     moved = []
     for row in rows:
         row = dict(row)
+        if row.get("source_kind") == "external_file":
+            continue
         original_name = row.get("original_file_name") or row["file_name"]
         current_path = None
         if row.get("stored_path"):

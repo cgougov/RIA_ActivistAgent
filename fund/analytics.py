@@ -336,7 +336,35 @@ def common_period_statistics(overlap, fund_ids, period_type="monthly"):
         values = [row[fund_id] for row in overlap]
         by_fund[fund_id] = return_statistics_from_values(values, period_type=period_type)
     return {"count": len(overlap), "period_start": overlap[0]["period"],
-            "period_end": overlap[-1]["period"], "by_fund": by_fund}
+            "period_end": overlap[-1]["period"], "by_fund": by_fund,
+            "correlations": pairwise_return_correlations(overlap, fund_ids)}
+
+
+def pairwise_return_correlations(overlap, fund_ids):
+    """Pearson correlations over the exact common return window.
+
+    Fewer than six shared monthly observations are shown as unavailable: a
+    numerical correlation exists but is not decision-useful at that sample size.
+    """
+    count = len(overlap)
+    rows = []
+    for index, left in enumerate(fund_ids):
+        for right in fund_ids[index + 1:]:
+            correlation = None
+            if count >= 6:
+                left_values = [row[left] for row in overlap]
+                right_values = [row[right] for row in overlap]
+                left_mean = statistics.mean(left_values)
+                right_mean = statistics.mean(right_values)
+                numerator = sum((a - left_mean) * (b - right_mean)
+                                for a, b in zip(left_values, right_values))
+                left_scale = math.sqrt(sum((a - left_mean) ** 2 for a in left_values))
+                right_scale = math.sqrt(sum((b - right_mean) ** 2 for b in right_values))
+                if left_scale and right_scale:
+                    correlation = round(numerator / (left_scale * right_scale), 2)
+            rows.append({"left": left, "right": right, "observations": count,
+                         "correlation": correlation})
+    return rows
 
 
 def monthly_analytics(returns, share_class=None):

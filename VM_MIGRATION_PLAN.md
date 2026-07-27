@@ -1,30 +1,30 @@
-# Windows VM Migration Plan
+# Windows Deployment Plan
 
-This document is the handoff for moving the Japan activist funds platform from
-the current macOS workspace into a Microsoft Windows virtual desktop.
+This document is the Windows deployment and maintenance checklist for the Japan
+activist funds platform.
 
 ## Current State
 
 Completed before migration:
 
 - Cleanup commit created: `64143bf Prepare platform for VM migration`.
-- `legacy/`, `.Rhistory`, `BUILD_PLAN.md`, generated `fund.egg-info/`, tracked
-  factsheet snapshots, old legacy DB/backups, and page-image cache were removed.
+- Generated `fund.egg-info/`, tracked factsheet snapshots, obsolete DB backups, and
+  page-image cache were removed.
 - `.gitignore` now excludes `.venv/`, `.env`, `data/db/`, `data/factsheets/`,
   `data/page_images/`, `exports/`, `.Rhistory`, and `fund.egg-info/`.
-- PDF source documents are committed under normalized per-fund folders in
-  `data/pdfs/`.
+- Shared-drive PDF sources remain external; locally managed copies, if any, live
+  under normalized `data/pdfs/` folders.
 - Factsheet snapshots are local artifacts only. They can be regenerated.
 - The live SQLite DB remains local at `data/db/fund.db` and is intentionally
   gitignored.
 - The OpenAI key remains local in `.env` and is intentionally gitignored.
 
-Verification already run on macOS:
+Verification baseline:
 
-```bash
-.venv/bin/python -m tests.test_pipeline
-.venv/bin/fund status
-.venv/bin/fund extract doc_003 --scope profile_terms --dry-run --force
+```powershell
+.\.venv\Scripts\python -m tests.test_pipeline
+.\.venv\Scripts\fund status
+.\.venv\Scripts\fund extract doc_003 --scope profile_terms --dry-run --force
 ```
 
 The plain dry-run without `--force` is expected to stop because existing
@@ -32,13 +32,12 @@ proposals already exist for `doc_003/profile_terms`.
 
 ## Recommended Transfer Strategy
 
-Use GitHub for source code and committed PDFs. Do not folder-copy the project.
+Use GitHub for source code. Do not folder-copy the project.
 
 Transfer through GitHub:
 
 - `fund/`
 - `tests/`
-- `data/pdfs/`
 - docs
 - packaging files such as `pyproject.toml`
 
@@ -46,6 +45,7 @@ Transfer separately, deliberately:
 
 - `.env` values, especially `OPENAI_API_KEY`
 - `data/db/fund.db` if the VM should start with the current approved database
+- `FUND_SOURCE_DOC_ROOT` if shared-drive PDFs should remain external
 
 Do not transfer:
 
@@ -104,7 +104,7 @@ Run these in PowerShell from the repo root:
 .\.venv\Scripts\Activate.ps1
 fund doctor
 fund status
-python -m tests.test_pipeline
+.\.venv\Scripts\python.exe -m tests.test_pipeline
 fund list
 fund factsheet simplex --sources
 fund similar simplex --limit 5
@@ -114,7 +114,7 @@ fund extract doc_003 --scope profile_terms --dry-run --force
 Expected results:
 
 - `fund doctor` shows the Windows Python executable.
-- `fund status` shows schema v2 if `data\db\fund.db` was copied.
+- `fund status` shows the current schema (v4) if `data\db\fund.db` was copied.
 - tests pass.
 - factsheet, returns, similarity, and dry-run extraction commands work.
 
@@ -129,13 +129,14 @@ Always dry-run before live API calls:
 fund analyze-activism --funds simplex --dry-run
 ```
 
-Then run one live test:
+Only if the deployment policy permits workspace-derived context to be sent to
+an external web-enabled model, run one live test:
 
 ```powershell
 fund analyze-activism --funds simplex
 ```
 
-This verifies:
+This verifies, where policy permits:
 
 - `.env` is loaded.
 - OpenAI API access works from the VM.
@@ -162,25 +163,21 @@ Future improvement:
 Do not commit `data/db/fund.db` unless you intentionally want SQLite DB blobs in
 Git history.
 
-## T-Drive Integration Backlog
-
-Build this only after the Windows VM baseline passes smoke tests.
+## T-Drive Integration
 
 Goal:
 
-- Let the platform discover and ingest new factsheets / presentations from the
-  T-drive or another Microsoft-mounted shared drive.
+- Let the platform discover and register new factsheets / presentations from the
+  T-drive or another Microsoft-mounted shared drive without copying the PDFs.
 
 Recommended design:
 
-- Add storage roots through environment variables in `fund/config.py`, for
-  example `FUND_SOURCE_DOC_ROOT`.
-- Keep existing normalized storage under `data/pdfs/`.
-- Add a CLI command such as:
+- Configure a storage root through `FUND_SOURCE_DOC_ROOT`.
+- Keep existing normalized storage under `data/pdfs/` only for explicitly managed copies.
+- Use the existing read-only inventory command:
 
 ```powershell
 fund discover-docs --root "T:\path\to\fund docs"
-fund import-docs --root "T:\path\to\fund docs" --dry-run
 ```
 
 Rules:
@@ -189,28 +186,18 @@ Rules:
 - Use `pathlib.Path` everywhere.
 - Dry-run before copying files.
 - Preserve source file path, original filename, doc type, and doc date.
-- Do not call the LLM during discovery/import.
+- Do not call the LLM during discovery.
 - Route extraction later through existing `fund onboard` / `fund extract`.
 
-## Post-Migration Codex Build Tasks
+## Remaining Product Priorities
 
-Give Codex this checklist after opening the repo on the Windows VM:
-
-1. Run the Windows smoke tests listed above and record results.
-2. Confirm `fund analyze-activism --funds simplex --dry-run` builds a prompt.
-3. Run one live API-backed activism check if approved.
-4. Add `fund doctor --storage` to check DB, PDFs, factsheets, page cache, and
-   source-doc root presence.
-5. Add optional DB bundle commands:
-   - `fund db-export path\to\bundle`
-   - `fund db-import path\to\bundle --dry-run`
-6. Design T-drive document discovery:
-   - file matching
-   - doc-date inference
-   - doc-type inference
-   - duplicate detection by SHA256
-   - dry-run table before import
-7. Add tests for Windows-style paths and T-drive discovery.
+1. Add an explicit fund-alias/crosswalk review workflow for T-drive folders,
+   database fund identities, and share classes.
+2. Add a reviewed workflow for `activist_universe_status` and `activity_status`.
+3. Design a source-backed performance-workbook crosswalk before importing any
+   workbook returns.
+4. Add a storage diagnostic only if normal `fund doctor` and
+   `fund discover-docs` prove insufficient.
 
 ## Open Decisions
 

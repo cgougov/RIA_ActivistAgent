@@ -8,6 +8,7 @@ import math
 import re
 
 from fund.factsheet import build_factsheet
+from fund.universe import classifications, is_eligible
 
 
 TEXT_FIELDS = {
@@ -56,7 +57,8 @@ SYNONYMS = {
 }
 
 
-def similar_funds(connection, target_fund_id, limit=None):
+def similar_funds(connection, target_fund_id, limit=None, activist_only=False,
+                  include_uncertain=False, include_candidates=False):
     fund_ids = [
         row["fund_id"] for row in connection.execute(
             "SELECT fund_id FROM funds ORDER BY fund_id"
@@ -64,17 +66,27 @@ def similar_funds(connection, target_fund_id, limit=None):
     ]
     if target_fund_id not in fund_ids:
         raise ValueError(f"Unknown fund_id: {target_fund_id}")
+    classes = {row["fund_id"]: row for row in classifications(connection, fund_ids)}
+    if activist_only and not is_eligible(
+            classes[target_fund_id], include_uncertain=include_uncertain,
+            include_candidates=include_candidates):
+        raise ValueError("Target is not an eligible activist under the selected universe rule.")
     sheets = {fund_id: build_factsheet(connection, fund_id) for fund_id in fund_ids}
     target = _profile(sheets[target_fund_id])
     rows = []
     for fund_id in fund_ids:
         if fund_id == target_fund_id:
             continue
+        if activist_only and not is_eligible(
+                classes[fund_id], include_uncertain=include_uncertain,
+                include_candidates=include_candidates):
+            continue
         score = _similarity_score(target, _profile(sheets[fund_id]))
         rows.append({
             "fund_id": fund_id,
             "fund_name": sheets[fund_id]["fund_name"],
             "manager_name": sheets[fund_id]["manager_name"],
+            "difference": _key_difference(sheets[target_fund_id], sheets[fund_id]),
             **score,
         })
     rows.sort(key=lambda row: (-row["score"], row["fund_id"]))
@@ -85,18 +97,27 @@ def similar_funds(connection, target_fund_id, limit=None):
             "fund_id": target_fund_id,
             "fund_name": sheets[target_fund_id]["fund_name"],
             "manager_name": sheets[target_fund_id]["manager_name"],
+            "context": _fund_context(sheets[target_fund_id]),
         },
         "basis": "strategy, AUM, and reported metrics; excludes terms and return history",
+        "activist_only": activist_only,
         "rows": rows,
     }
 
 
-def all_pairwise_similarity(connection):
+def all_pairwise_similarity(connection, activist_only=False, include_uncertain=False,
+                            include_candidates=False):
     fund_ids = [
         row["fund_id"] for row in connection.execute(
             "SELECT fund_id FROM funds ORDER BY fund_id"
         ).fetchall()
     ]
+    classes = {row["fund_id"]: row for row in classifications(connection, fund_ids)}
+    if activist_only:
+        fund_ids = [fund_id for fund_id in fund_ids if is_eligible(
+            classes[fund_id], include_uncertain=include_uncertain,
+            include_candidates=include_candidates,
+        )]
     sheets = {fund_id: build_factsheet(connection, fund_id) for fund_id in fund_ids}
     profiles = {fund_id: _profile(sheet) for fund_id, sheet in sheets.items()}
     rows = []
@@ -113,6 +134,7 @@ def all_pairwise_similarity(connection):
     rows.sort(key=lambda row: (-row["score"], row["left"], row["right"]))
     return {
         "basis": "strategy, AUM, and reported metrics; excludes terms and return history",
+        "activist_only": activist_only,
         "pairs": rows,
     }
 
@@ -122,18 +144,22 @@ def format_similar(result):
     lines = [
         f"Similar funds to {target['fund_name']} ({target['fund_id']})",
         "-" * (len(target["fund_name"]) + len(target["fund_id"]) + 19),
+        f"Context: {target['context']}",
         f"Basis: {result['basis']}",
         "",
     ]
     if not result["rows"]:
         lines.append("No peer funds available.")
         return "\n".join(lines)
-    lines.append(f"  {'score':>5}  {'fund_id':<10} {'fund':<34} why")
-    for row in result["rows"]:
-        why = "; ".join(row["positive_reasons"][:3]) or "limited approved overlap"
-        if row["negative_reasons"]:
-            why = f"{why}; gap: {row['negative_reasons'][0]}"
-        lines.append(f"  {row['score']:>5.2f}  {row['fund_id']:<10} {row['fund_name'][:34]:<34} {why}")
+    lines.append("Peer-by-peer difference from the target:")
+    for index, row in enumerate(result["rows"], start=1):
+        overlap = "; ".join(row["positive_reasons"][:2]) or "limited approved overlap"
+        difference = row["difference"] or (
+            row["negative_reasons"][0] if row["negative_reasons"] else "not enough approved detail"
+        )
+        lines.append(f"  {index}. {row['fund_name']} (score {row['score']:.2f})")
+        lines.append(f"     Similarity: {overlap}.")
+        lines.append(f"     Difference: {difference}.")
     return "\n".join(lines)
 
 
@@ -166,6 +192,49 @@ def _profile(sheet):
                 if value is not None:
                     numeric[key] = float(value)
     return {"text": text, "numeric": numeric}
+
+
+def _field_text(sheet, field_key):
+    for section in sheet.get("sections", {}).values():
+        for entry in section:
+            if entry.get("field_key") == field_key and entry.get("value"):
+                return str(entry["value"]).strip()
+    return None
+
+
+def _short(value, limit=105):
+    value = " ".join(str(value or "").split())
+    return value if len(value) <= limit else value[:limit - 3].rstrip() + "..."
+
+
+def _fund_context(sheet):
+    style = _field_text(sheet, "activism_style") or _field_text(sheet, "primary_strategy")
+    geography = _field_text(sheet, "geography_focus")
+    market_cap = _field_text(sheet, "market_cap_focus")
+    bits = []
+    if style:
+        bits.append(f"is described as {_short(style, 125)}")
+    if geography:
+        bits.append(f"focuses on {_short(geography, 60)}")
+    if market_cap:
+        bits.append(f"targets {_short(market_cap, 60)}")
+    if not bits:
+        return "approved strategy context is currently sparse"
+    return f"{sheet['fund_name']} " + "; ".join(bits) + "."
+
+
+def _key_difference(target_sheet, peer_sheet):
+    for field_key, label in (
+        ("activism_style", "Activism style"),
+        ("primary_strategy", "Primary strategy"),
+        ("value_creation_approach", "Value-creation approach"),
+        ("market_cap_focus", "Market-cap focus"),
+        ("geography_focus", "Geography focus"),
+    ):
+        left, right = _field_text(target_sheet, field_key), _field_text(peer_sheet, field_key)
+        if left and right and _tokens(left) != _tokens(right):
+            return f"{label}: target says '{_short(left, 80)}' versus peer '{_short(right, 80)}'"
+    return None
 
 
 def _tokens(value):

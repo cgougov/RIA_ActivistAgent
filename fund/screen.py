@@ -2,6 +2,7 @@
 import re
 
 from fund.factsheet import build_factsheet
+from fund.universe import classifications, is_eligible
 
 
 PRESETS = {
@@ -114,13 +115,21 @@ def _matches_preset(sheet, preset):
     return True, matched
 
 
-def screen_funds(connection, where=None, preset=None, min_history_years=None, sort_field=None, descending=True):
+def screen_funds(connection, where=None, preset=None, min_history_years=None, sort_field=None,
+                 descending=True, activist_only=False, include_uncertain=False,
+                 include_candidates=False):
     fund_ids = [
         row["fund_id"]
         for row in connection.execute("SELECT fund_id FROM funds ORDER BY fund_id").fetchall()
     ]
+    classes = {row["fund_id"]: row for row in classifications(connection, fund_ids)}
     rows = []
     for fund_id in fund_ids:
+        classification = classes[fund_id]
+        if activist_only and not is_eligible(
+                classification, include_uncertain=include_uncertain,
+                include_candidates=include_candidates):
+            continue
         sheet = build_factsheet(connection, fund_id)
         analytics = _first_analytics(sheet)
         if min_history_years is not None and (analytics.get("count", 0) / 12) < min_history_years:
@@ -132,7 +141,7 @@ def screen_funds(connection, where=None, preset=None, min_history_years=None, so
             ok, matched = _matches_preset(sheet, preset)
             if not ok:
                 continue
-        rows.append(_screen_row(sheet, matched))
+        rows.append(_screen_row(sheet, matched, classification))
     if sort_field:
         def sort_key(row):
             value = row["metrics"].get(sort_field)
@@ -140,10 +149,14 @@ def screen_funds(connection, where=None, preset=None, min_history_years=None, so
                 return float("-inf") if descending else float("inf")
             return value
         rows.sort(key=sort_key, reverse=descending)
-    return {"preset": preset, "where": where or [], "rows": rows}
+    return {
+        "preset": preset, "where": where or [], "rows": rows,
+        "activist_only": activist_only, "include_uncertain": include_uncertain,
+        "include_candidates": include_candidates,
+    }
 
 
-def _screen_row(sheet, matched):
+def _screen_row(sheet, matched, classification):
     analytics = _first_analytics(sheet)
     fields = {
         key: (_field_value(sheet, key) or {}).get("value")
@@ -172,6 +185,7 @@ def _screen_row(sheet, matched):
         "matched": sorted(set(matched)),
         "approved_fields": sheet["coverage"]["fund_level_fields_filled"],
         "return_rows": sheet["coverage"]["return_rows"],
+        "classification": classification,
     }
 
 
@@ -184,24 +198,32 @@ def format_screen(result):
     lines.extend([heading, "-" * len(heading)])
     if result.get("where"):
         lines.append("Filters: " + ", ".join(result["where"]))
+    if result.get("activist_only"):
+        lines.append("Universe: verified activists with active status"
+                     + ("; uncertain included" if result.get("include_uncertain") else "")
+                     + ("; candidates included" if result.get("include_candidates") else ""))
     if not rows:
         lines.append("No funds matched.")
         return "\n".join(lines)
     lines.append(
         f"  {'fund':<12} {'ann Sharpe':>10} {'ann vol':>8} {'max DD':>8} "
-        f"{'years':>6} {'fields':>7}  strategy / match"
+        f"{'years':>6} {'fields':>7}  universe / strategy"
     )
     for row in rows:
         metrics = row["metrics"]
         strategy = row["fields"].get("activism_style") or row["fields"].get("primary_strategy") or "-"
         matched = f" | matched: {', '.join(row['matched'])}" if row["matched"] else ""
+        classification = row["classification"]
+        status = (classification.get("activist_universe_status") or "unclassified") + "/" + (
+            classification.get("activity_status") or "unclassified"
+        )
         lines.append(
             f"  {row['fund_id']:<12} "
             f"{_fmt(metrics.get('annualized_sharpe')):>10} "
             f"{_fmt(metrics.get('annualized_volatility')):>8} "
             f"{_fmt(metrics.get('max_drawdown')):>8} "
             f"{_fmt(metrics.get('years_history')):>6} "
-            f"{row['approved_fields']:>7}  {strategy[:64]}{matched}"
+            f"{row['approved_fields']:>7}  {status}; {strategy[:48]}{matched}"
         )
     return "\n".join(lines)
 

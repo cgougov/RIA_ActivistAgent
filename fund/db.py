@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fund.config import DB_PATH
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 4
 
 
 def utc_now():
@@ -55,7 +55,16 @@ CREATE TABLE IF NOT EXISTS documents (
     page_count          INTEGER,
     is_current          INTEGER NOT NULL DEFAULT 0,
     supersedes_doc_id   TEXT REFERENCES documents (doc_id),
+    source_kind         TEXT NOT NULL DEFAULT 'managed_copy',
+    source_path         TEXT,
     created_at          TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fund_aliases (
+    alias       TEXT PRIMARY KEY COLLATE NOCASE,
+    fund_id     TEXT NOT NULL REFERENCES funds (fund_id),
+    alias_type  TEXT NOT NULL DEFAULT 'manual',
+    created_at  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pages (
@@ -64,6 +73,13 @@ CREATE TABLE IF NOT EXISTS pages (
     text         TEXT,
     image_path   TEXT,
     PRIMARY KEY (doc_id, page_number)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(
+    doc_id UNINDEXED,
+    fund_id UNINDEXED,
+    page_number UNINDEXED,
+    text
 );
 
 CREATE TABLE IF NOT EXISTS proposals (
@@ -185,6 +201,10 @@ CREATE TABLE IF NOT EXISTS snapshot_embeddings (
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_documents_fund_type_date_current
     ON documents (fund_id, doc_type, doc_date, is_current);
+CREATE INDEX IF NOT EXISTS idx_documents_source_path
+    ON documents (source_path);
+CREATE INDEX IF NOT EXISTS idx_fund_aliases_fund
+    ON fund_aliases (fund_id);
 CREATE INDEX IF NOT EXISTS idx_pages_doc_page
     ON pages (doc_id, page_number);
 CREATE INDEX IF NOT EXISTS idx_proposals_fund_status_field_share
@@ -334,6 +354,20 @@ def _normalize_current_documents(connection):
                 )
 
 
+def rebuild_page_search(connection):
+    """Rebuild the local full-text index from stored page text."""
+    connection.execute("DELETE FROM page_search")
+    connection.execute(
+        """
+        INSERT INTO page_search (doc_id, fund_id, page_number, text)
+        SELECT p.doc_id, d.fund_id, p.page_number, COALESCE(p.text, '')
+        FROM pages p
+        JOIN documents d ON d.doc_id = p.doc_id
+        WHERE COALESCE(p.text, '') != ''
+        """
+    )
+
+
 def backup_database(db_path=DB_PATH):
     if not db_path.exists():
         return None
@@ -345,7 +379,7 @@ def backup_database(db_path=DB_PATH):
     return backup_path
 
 
-def migrate_to_latest(connection, organize_files=True):
+def migrate_to_latest(connection, organize_files=False):
     from fund.ingest import organize_existing_documents
 
     if _is_empty_database(connection):
@@ -368,6 +402,8 @@ def migrate_to_latest(connection, organize_files=True):
     _ensure_column(connection, "documents", "stored_path", "TEXT")
     _ensure_column(connection, "documents", "is_current", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(connection, "documents", "supersedes_doc_id", "TEXT")
+    _ensure_column(connection, "documents", "source_kind", "TEXT NOT NULL DEFAULT 'managed_copy'")
+    _ensure_column(connection, "documents", "source_path", "TEXT")
     _migrate_facts_share_class(connection)
 
     connection.execute(
@@ -376,7 +412,11 @@ def migrate_to_latest(connection, organize_files=True):
     connection.execute(
         "UPDATE documents SET stored_path = COALESCE(stored_path, file_name)"
     )
+    connection.execute(
+        "UPDATE documents SET source_path = COALESCE(source_path, stored_path)"
+    )
     _normalize_current_documents(connection)
+    rebuild_page_search(connection)
     if organize_files:
         organize_existing_documents(connection)
 
